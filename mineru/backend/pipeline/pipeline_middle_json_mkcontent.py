@@ -23,7 +23,12 @@ def make_blocks_to_markdown(paras_of_layout,
             BlockType.LIST,
             BlockType.INDEX,
             BlockType.ABSTRACT,
-            BlockType.REF_TEXT
+            BlockType.REF_TEXT,
+            BlockType.HEADER,
+            BlockType.FOOTER,
+            BlockType.PAGE_NUMBER,
+            BlockType.ASIDE_TEXT,
+            BlockType.PAGE_FOOTNOTE,
         ]:
             para_text = merge_para_with_text(para_block)
         elif para_type == BlockType.TITLE:
@@ -959,7 +964,7 @@ def make_blocks_to_content_list_v2(para_block, img_buket_path, page_size):
 
     return para_content
 
-
+# 遍历 para_blocks，逐块调用 make_blocks_to_content_list() 或 make_blocks_to_content_list_v2()
 def union_make(pdf_info_dict: list,
                make_mode: str,
                img_buket_path: str = '',

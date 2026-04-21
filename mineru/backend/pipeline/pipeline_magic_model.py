@@ -1,5 +1,6 @@
 from mineru.backend.pipeline.para_split import ListLineTag
 from mineru.backend.pipeline.pipeline_middle_json_mkcontent import _merge_para_text
+from mineru.custom.discard_policy.discard_policy import DiscardPolicy
 from mineru.utils.boxbase import (
     bbox_center_distance,
     bbox_distance,
@@ -75,6 +76,7 @@ class MagicModel:
         page_w=None,
         page_h=None,
         ocr_enable=False,
+        discard_policy=None,
     ):
         self.__page_model_info = page_model_info
         self.page_inline_formula = []
@@ -86,11 +88,18 @@ class MagicModel:
         self.all_image_spans = []
         self.__layout_det_by_index = {}
         self.__scale = scale
+        self.__discard_policy = (
+            discard_policy if isinstance(discard_policy, DiscardPolicy) else DiscardPolicy.from_raw(discard_policy)
+        )
+        # 7 个子步骤
+        # 1. bbox坐标修正，删除高度或者宽度小于等于0的spans
         self.__fix_axis()  # bbox坐标修正，删除高度或者宽度小于等于0的spans
+        # 2. 重新编排 index 序号，填充行内公式和文本span
         self.__post_process()  # index重排，填充行内公式和文本span
+        # 3. 非 OCR 模式时从 PDF 中提取原生文字 span
         if not ocr_enable:
             virtual_block = [0, 0, page_w, page_h, None, None, None, "text"]
-            self.page_ocr_res = txt_spans_extract(
+            self.page_ocr_res = txt_spans_extract( # 合并行内公式 + 文字 span 为 page_text_inline_formula_spans
                 page,
                 self.page_ocr_res,
                 page_pil_img,
@@ -100,13 +109,14 @@ class MagicModel:
             )
         self.page_text_inline_formula_spans = self.page_inline_formula + self.page_ocr_res
 
+        # 4. 构建 page_blocks
         for layout_det in self.__page_model_info['layout_dets']:
             if layout_det.get('label') in self.PP_DOCLAYOUT_V2_LABELS_TO_BLOCK_TYPES:
                 block_bbox = layout_det['bbox']
                 block_type = self.PP_DOCLAYOUT_V2_LABELS_TO_BLOCK_TYPES[layout_det['label']]
                 block_index = layout_det['index']
                 block_score = layout_det['score']
-                block = self.__copy_block_fields(
+                block = self.__copy_block_fields( # 按映射表转 label → BlockType（例如 "text"→TEXT, "table"→TABLE, "image"→IMAGE）
                     layout_det,
                     type=block_type,
                     bbox=block_bbox,
@@ -115,9 +125,12 @@ class MagicModel:
                 )
                 self.page_blocks.append(block)
 
-        self.page_blocks.sort(key=lambda x: x["index"])
+        self.page_blocks.sort(key=lambda x: x["index"]) # 按 index 排序
+        # 5. 将 page_text_inline_formula_spans 中的 span 按 bbox 重叠率 >50% 分配到对应 block
         self.__build_page_blocks()
+        # 6. 为每个 caption/footnote 找最佳父块（按 index 距离 + bbox 距离排序），未配对的 caption/footnote 降级为 TEXT
         self.__classify_visual_blocks()
+        # 7. 构建 preproc_blocks 和 discarded_blocks
         self.__build_return_blocks()
 
 
@@ -174,14 +187,8 @@ class MagicModel:
         self.preproc_blocks = []
         self.discarded_blocks = []
         for block in self.page_blocks:
-            if block["type"] in [
-                BlockType.HEADER,
-                BlockType.FOOTER,
-                BlockType.PAGE_NUMBER,
-                BlockType.ASIDE_TEXT,
-                BlockType.PAGE_FOOTNOTE
-            ]:
-                self.discarded_blocks.append(block)
+            if self.__discard_policy.should_discard(block):
+                self.discarded_blocks.append(block) # 页眉/页脚/页码等
             else:
                 # 单独处理code block
                 if block["type"] in [BlockType.CODE]:
@@ -191,7 +198,7 @@ class MagicModel:
                             if block["sub_type"] == "code":
                                 block["guess_lang"] = sub_block.pop("guess_lang", "txt")
 
-                self.preproc_blocks.append(block)
+                self.preproc_blocks.append(block) # 主要内容
 
     def __build_page_blocks(self):
         span_type = "unknown"
@@ -237,17 +244,17 @@ class MagicModel:
                     "bbox": block["bbox"],
                     "type": span_type,
                 }
-                if span_type == ContentType.TABLE:
+                if span_type == ContentType.TABLE: # 表格 HTML
                     span["html"] = block.get("html", "")
                     block.pop("html", None)
-                if span_type == ContentType.INTERLINE_EQUATION:
+                if span_type == ContentType.INTERLINE_EQUATION: # 公式 LaTeX
                     span["content"] = block.get("latex", "")
                     block.pop("latex", None)
                 if span_type == ContentType.SEAL:
-                    span["content"] = block.get("text")
+                    span["content"] = block.get("text") # 印章文字
                     block.pop("text", None)
 
-                self.all_image_spans.append(span)
+                self.all_image_spans.append(span) # ★后续截图用
                 # 构造line对象
                 spans = [span]
                 line = {"bbox": block["bbox"], "spans": spans}
@@ -278,6 +285,7 @@ class MagicModel:
                 block = self.__fix_text_block(block)
 
     def __fix_axis(self):
+        # 将 bbox 从模型坐标（scale倍）还原为 PDF 原始坐标（除以 scale）
         need_remove_list = []
         layout_dets = self.__page_model_info["layout_dets"]
         for layout_det in layout_dets:
@@ -296,9 +304,11 @@ class MagicModel:
             layout_dets.remove(need_remove)
 
     def __post_process(self):
+        # 重新编排 index 序号
         next_index = 1
         layout_dets = self.__page_model_info["layout_dets"]
         for layout_det in layout_dets:
+            # 将行内公式提取到 page_inline_formula 列表
             if self.__is_inline_formula_block(layout_det):
                 layout_det.pop("index", None)
                 self.page_inline_formula.append({
@@ -309,6 +319,7 @@ class MagicModel:
                 })
                 continue
 
+            # 将 ocr_text 元素提取到 page_ocr_res 列表（含 text content）
             if self.__is_ocr_text_block(layout_det):
                 self.page_ocr_res.append({
                     "bbox": layout_det["bbox"],
@@ -321,6 +332,7 @@ class MagicModel:
             if "index" in layout_det:
                 layout_det["index"] = next_index
                 next_index += 1
+            # 其余元素保留在 layout_dets 中
 
     def __classify_visual_blocks(self):
         if not self.page_blocks:
@@ -426,8 +438,9 @@ class MagicModel:
             else:
                 self.chart_groups.append(group_info)
 
+            # 构造二层嵌套结构
             two_layer_block = {
-                "type": original_block_type,
+                "type": original_block_type, # TABLE / IMAGE / CHART
                 "bbox": block["bbox"],
                 "blocks": [body_block, *captions, *footnotes],
                 "index": block["index"],

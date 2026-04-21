@@ -17,6 +17,7 @@ from .model_output_to_middle_json import (
     finalize_middle_json,
     init_middle_json,
 )
+from mineru.custom.registry import resolve_discard_policy
 from mineru.backend.utils import exclude_progress_bar_idle_time
 from ...data.data_reader_writer import DataWriter
 from mineru.utils.pdf_image_tools import load_images_from_pdf_doc
@@ -297,11 +298,13 @@ def doc_analyze(
     backend="transformers",
     model_path: str | None = None,
     server_url: str | None = None,
+    discard_types=None,
     **kwargs,
 ):
     if predictor is None:
         predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
     predictor = _maybe_enable_serial_execution(predictor, backend)
+    discard_policy = resolve_discard_policy(discard_types)
 
     pdf_doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes)
     middle_json = init_middle_json()
@@ -359,6 +362,7 @@ def doc_analyze(
                         pdf_doc,
                         image_writer,
                         page_start_index=window_start,
+                        discard_policy=discard_policy,
                         progress_bar=progress_bar,
                     )
                     last_append_end_time = time.time()
@@ -389,11 +393,13 @@ async def aio_doc_analyze(
     backend="transformers",
     model_path: str | None = None,
     server_url: str | None = None,
+    discard_types=None,
     **kwargs,
 ):
     if predictor is None:
         predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
     predictor = _maybe_enable_serial_execution(predictor, backend)
+    discard_policy = resolve_discard_policy(discard_types)
 
     pdf_doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes)
     middle_json = init_middle_json()
@@ -451,6 +457,7 @@ async def aio_doc_analyze(
                         pdf_doc,
                         image_writer,
                         page_start_index=window_start,
+                        discard_policy=discard_policy,
                         progress_bar=progress_bar,
                     )
                     last_append_end_time = time.time()

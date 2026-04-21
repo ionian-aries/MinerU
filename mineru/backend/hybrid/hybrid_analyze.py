@@ -16,6 +16,7 @@ from mineru.backend.hybrid.hybrid_model_output_to_middle_json import (
     finalize_middle_json,
     init_middle_json,
 )
+from mineru.custom.registry import resolve_discard_policy
 from mineru.backend.utils import exclude_progress_bar_idle_time
 from mineru.backend.pipeline.model_init import HybridModelSingleton
 from mineru.backend.vlm.vlm_analyze import (
@@ -302,13 +303,13 @@ def _process_ocr_and_formulas(
 
     if inline_formula_enable:
         # 在进行`行内`公式检测和识别前，先将图像中的图片、表格、`行间`公式区域mask掉
-        np_images = mask_image_regions(np_images, model_list)
+        np_images = mask_image_regions(np_images, model_list) # 将图片/表格/行间公式区域涂白（避免干扰行内公式检测）
         # 使用layout模型提供行内公式检测框
-        images_layout_res = hybrid_pipeline_model.layout_model.batch_predict(
+        images_layout_res = hybrid_pipeline_model.layout_model.batch_predict( # 使用版面分析模型检测行内公式位置
             np_images,
             batch_size=min(8, batch_ratio * LAYOUT_BASE_BATCH_SIZE),
         )
-        images_mfd_res = _build_inline_formula_inputs(images_layout_res)
+        images_mfd_res = _build_inline_formula_inputs(images_layout_res) # 构建行内公式模型项
         # 公式识别
         inline_formula_list = hybrid_pipeline_model.mfr_model.batch_predict(
             images_mfd_res,
@@ -330,7 +331,7 @@ def _process_ocr_and_formulas(
         mfd_res.append(page_mfd_res)
 
     # vlm没有执行ocr，需要ocr_det
-    ocr_res_list = ocr_det(
+    ocr_res_list = ocr_det( # 对检测到的文字区域进行识别，过滤低置信度结果
         hybrid_pipeline_model,
         np_images,
         model_list,
@@ -396,8 +397,8 @@ def _process_ocr_and_formulas(
                 if need_ocr_res in page_ocr_res_list:
                     page_ocr_res_list.remove(need_ocr_res)
 
-    _normalize_bbox(inline_formula_list, ocr_res_list, images_pil_list)
-    merged_model_list = _merge_page_sidecar_items(
+    _normalize_bbox(inline_formula_list, ocr_res_list, images_pil_list) # 坐标归一化
+    merged_model_list = _merge_page_sidecar_items( # 合并VLM结果+公式+OCR文本
         model_list,
         inline_formula_list,
         ocr_res_list,
@@ -547,6 +548,7 @@ def doc_analyze(
         inline_formula_enable: bool = True,
         model_path: str | None = None,
         server_url: str | None = None,
+        discard_types=None,
         **kwargs,
 ):
     if predictor is None:
@@ -556,6 +558,7 @@ def doc_analyze(
     device = get_device()
     _ocr_enable = ocr_classify(pdf_bytes, parse_method=parse_method)
     _vlm_ocr_enable = _should_enable_vlm_ocr(_ocr_enable, language, inline_formula_enable)
+    discard_policy = resolve_discard_policy(discard_types)
 
     pdf_doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes)
     middle_json = init_middle_json(_ocr_enable, _vlm_ocr_enable)
@@ -634,6 +637,7 @@ def doc_analyze(
                         page_start_index=window_start,
                         _ocr_enable=_ocr_enable,
                         _vlm_ocr_enable=_vlm_ocr_enable,
+                        discard_policy=discard_policy,
                         progress_bar=progress_bar,
                     )
                     last_append_end_time = time.time()
@@ -675,24 +679,26 @@ async def aio_doc_analyze(
     inline_formula_enable: bool = True,
     model_path: str | None = None,
     server_url: str | None = None,
+    discard_types=None,
     **kwargs,
 ):
     if predictor is None:
-        predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
+        predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs) # 获取VLM预测器实例（支持transformers/vllm等后端）
     predictor = _maybe_enable_serial_execution(predictor, backend)
 
     device = get_device()
-    _ocr_enable = ocr_classify(pdf_bytes, parse_method=parse_method)
-    _vlm_ocr_enable = _should_enable_vlm_ocr(_ocr_enable, language, inline_formula_enable)
+    _ocr_enable = ocr_classify(pdf_bytes, parse_method=parse_method) # 根据parse_method判断OCR模式：auto/text/ocr
+    _vlm_ocr_enable = _should_enable_vlm_ocr(_ocr_enable, language, inline_formula_enable) # 判断是否启用VLM端到端OCR，条件：ocr_enable && language∈[ch,en] && inline_formula_enable
+    discard_policy = resolve_discard_policy(discard_types) # 解析丢弃类型策略（header/footer等）
 
-    pdf_doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes)
-    middle_json = init_middle_json(_ocr_enable, _vlm_ocr_enable)
+    pdf_doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes) # 使用pdfium打开PDF文档
+    middle_json = init_middle_json(_ocr_enable, _vlm_ocr_enable) # 初始化middle_json，包含_ocr_enable、_vlm_ocr_enable标记
     model_list = []
     doc_closed = False
     hybrid_pipeline_model = None
     try:
-        page_count = get_pdfium_document_page_count(pdf_doc)
-        configured_window_size = get_processing_window_size(default=64)
+        page_count = get_pdfium_document_page_count(pdf_doc) 
+        configured_window_size = get_processing_window_size(default=64) # 获取处理窗口大小（默认64页），计算total_windows
         effective_window_size = min(page_count, configured_window_size) if page_count else 0
         total_windows = (
             (page_count + effective_window_size - 1) // effective_window_size
@@ -704,7 +710,7 @@ async def aio_doc_analyze(
             f'window_size={configured_window_size}, total_windows={total_windows}'
         )
 
-        batch_ratio = get_batch_ratio(device) if not _vlm_ocr_enable else 1
+        batch_ratio = get_batch_ratio(device) if not _vlm_ocr_enable else 1 # 根据显存大小计算batch_ratio（1-16），用于OCR批处理
 
         infer_start = time.time()
         progress_bar = None
@@ -712,7 +718,7 @@ async def aio_doc_analyze(
         try:
             for window_index, window_start in enumerate(range(0, page_count, effective_window_size or 1)):
                 window_end = min(page_count - 1, window_start + effective_window_size - 1)
-                images_list = load_images_from_pdf_doc(
+                images_list = load_images_from_pdf_doc( # 将PDF页面渲染为PIL Image列表
                     pdf_doc,
                     start_page_id=window_start,
                     end_page_id=window_end,
@@ -728,7 +734,7 @@ async def aio_doc_analyze(
                     )
                     if _vlm_ocr_enable:
                         async with aio_predictor_execution_guard(predictor):
-                            window_model_list = await predictor.aio_batch_two_step_extract(images=images_pil_list)
+                            window_model_list = await predictor.aio_batch_two_step_extract(images=images_pil_list) # VLM模型推理，返回版面分析结果
                     else:
                         async with aio_predictor_execution_guard(predictor):
                             window_model_list = await predictor.aio_batch_two_step_extract(
@@ -762,6 +768,7 @@ async def aio_doc_analyze(
                         page_start_index=window_start,
                         _ocr_enable=_ocr_enable,
                         _vlm_ocr_enable=_vlm_ocr_enable,
+                        discard_policy=discard_policy,
                         progress_bar=progress_bar,
                     )
                     last_append_end_time = time.time()

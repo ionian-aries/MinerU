@@ -1,4 +1,5 @@
 import asyncio
+import json
 import mimetypes
 import os
 import shutil
@@ -42,6 +43,7 @@ from mineru.cli.common import (
     read_fn,
     uniquify_task_stems,
 )
+from mineru.custom.registry import resolve_discard_policy
 from mineru.cli.output_paths import resolve_parse_dir
 from mineru.cli.api_protocol import (
     API_PROTOCOL_VERSION,
@@ -56,6 +58,7 @@ from mineru.utils.config_reader import (
 )
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_path
 from mineru.version import __version__
+from mineru.custom.custom_config_loader import load_custom_config
 
 os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
 log_level = os.getenv("MINERU_LOG_LEVEL", "INFO").upper()
@@ -98,8 +101,11 @@ class ParseRequestOptions:
     parse_method: str
     formula_enable: bool
     table_enable: bool
+    discard_types: Optional[str]
+    storage_options_json: Optional[str]
     server_url: Optional[str]
     return_md: bool
+    return_enhance_json: bool
     return_middle_json: bool
     return_model_output: bool
     return_content_list: bool
@@ -129,8 +135,11 @@ class AsyncParseTask:
     lang_list: list[str]
     formula_enable: bool
     table_enable: bool
+    discard_types: Optional[str]
+    storage_options_json: Optional[str]
     server_url: Optional[str]
     return_md: bool
+    return_enhance_json: bool
     return_middle_json: bool
     return_model_output: bool
     return_content_list: bool
@@ -362,6 +371,7 @@ def build_result_dict(
     backend: str,
     parse_method: str,
     return_md: bool,
+    return_enhance_json: bool,
     return_middle_json: bool,
     return_model_output: bool,
     return_content_list: bool,
@@ -383,6 +393,14 @@ def build_result_dict(
 
         if return_md:
             data["md_content"] = get_infer_result(".md", pdf_name, parse_dir)
+        if return_enhance_json:
+            enhancement_path = os.path.join(parse_dir, f"{pdf_name}_enhance.json")
+            if os.path.exists(enhancement_path):
+                data["enhance_json"] = get_infer_result(
+                    "_enhance.json",
+                    pdf_name,
+                    parse_dir,
+                )
         if return_middle_json:
             data["middle_json"] = get_infer_result("_middle.json", pdf_name, parse_dir)
         if return_model_output:
@@ -400,6 +418,13 @@ def build_result_dict(
                 ): f"data:{get_image_mime_type(image_path)};base64,{encode_image(image_path)}"
                 for image_path in image_paths
             }
+            images_manifest_path = os.path.join(parse_dir, "images.json")
+            if os.path.exists(images_manifest_path):
+                data["images_manifest"] = get_infer_result(
+                    "images.json",
+                    "",
+                    parse_dir,
+                )
     return result_dict
 
 
@@ -417,6 +442,7 @@ def create_result_zip(
     backend: str,
     parse_method: str,
     return_md: bool,
+    return_enhance_json: bool,
     return_middle_json: bool,
     return_model_output: bool,
     return_content_list: bool,
@@ -446,6 +472,17 @@ def create_result_zip(
                             pdf_name,
                             parse_dir,
                             f"{pdf_name}.md",
+                        ),
+                    )
+            if return_enhance_json:
+                enhancement_path = os.path.join(parse_dir, f"{pdf_name}_enhance.json")
+                if os.path.exists(enhancement_path):
+                    zf.write(
+                        enhancement_path,
+                        arcname=build_zip_arcname(
+                            pdf_name,
+                            parse_dir,
+                            f"{pdf_name}_enhance.json",
                         ),
                     )
 
@@ -508,6 +545,16 @@ def create_result_zip(
                             os.path.join("images", os.path.basename(image_path)),
                         ),
                     )
+                images_manifest_path = os.path.join(parse_dir, "images.json")
+                if os.path.exists(images_manifest_path):
+                    zf.write(
+                        images_manifest_path,
+                        arcname=build_zip_arcname(
+                            pdf_name,
+                            parse_dir,
+                            "images.json",
+                        ),
+                    )
 
             if return_original_file:
                 origin_pattern = f"{pdf_name}_origin."
@@ -541,6 +588,8 @@ def build_result_response(
     return_images: bool,
     response_format_zip: bool,
     return_original_file: bool,
+    *,
+    return_enhance_json: bool = False,
 ) -> Response:
     if response_format_zip:
         zip_path = create_result_zip(
@@ -549,6 +598,7 @@ def build_result_response(
             backend=backend,
             parse_method=parse_method,
             return_md=return_md,
+            return_enhance_json=return_enhance_json,
             return_middle_json=return_middle_json,
             return_model_output=return_model_output,
             return_content_list=return_content_list,
@@ -569,6 +619,7 @@ def build_result_response(
         backend=backend,
         parse_method=parse_method,
         return_md=return_md,
+        return_enhance_json=return_enhance_json,
         return_middle_json=return_middle_json,
         return_model_output=return_model_output,
         return_content_list=return_content_list,
@@ -609,6 +660,7 @@ def build_sync_file_parse_response(
             backend=task.backend,
             parse_method=task.parse_method,
             return_md=task.return_md,
+            return_enhance_json=task.return_enhance_json,
             return_middle_json=task.return_middle_json,
             return_model_output=task.return_model_output,
             return_content_list=task.return_content_list,
@@ -628,6 +680,7 @@ def build_sync_file_parse_response(
         backend=task.backend,
         parse_method=task.parse_method,
         return_md=task.return_md,
+        return_enhance_json=task.return_enhance_json,
         return_middle_json=task.return_middle_json,
         return_model_output=task.return_model_output,
         return_content_list=task.return_content_list,
@@ -645,6 +698,7 @@ def build_sync_file_parse_response(
 
 
 async def parse_request_form(
+    request: Request,
     files: list[UploadFile] = File(
         ..., description="Upload pdf or image files for parsing"
     ),
@@ -689,11 +743,23 @@ async def parse_request_form(
     ),
     formula_enable: bool = Form(True, description="Enable formula parsing."),
     table_enable: bool = Form(True, description="Enable table parsing."),
+    discard_types: Optional[str] = Form(
+        None,
+        description="Comma-separated BlockType values to discard.",
+    ),
+    storage_options_json: Optional[str] = Form(
+        None,
+        description="Storage options JSON string for image/doc writers.",
+    ),
     server_url: Optional[str] = Form(
         None,
         description="(Adapted only for <vlm/hybrid>-http-client backend)openai compatible server url, e.g., http://127.0.0.1:30000",
     ),
     return_md: bool = Form(True, description="Return markdown content in response"),
+    return_enhance_json: bool = Form(
+        True,
+        description="Include *_enhance.json in response if it exists (ignored unless response_format_zip=true or return_md=true).",
+    ),
     return_middle_json: bool = Form(
         False, description="Return middle JSON in response"
     ),
@@ -723,7 +789,68 @@ async def parse_request_form(
         99999, description="The ending page for PDF parsing, beginning from 0"
     ),
 ) -> ParseRequestOptions:
+    service_cfg = getattr(request.app.state, "custom_config", None)
+
+    # Custom mode contract (service-level fixed config):
+    # - If server is started without --custom-config, custom features are disabled.
+    # - Request-level overrides for discard/storage are not allowed.
+    if service_cfg is None:
+        if discard_types is not None and str(discard_types).strip():
+            raise HTTPException(
+                status_code=400,
+                detail="discard_types is not supported unless the server is started with --custom-config.",
+            )
+        if storage_options_json is not None and str(storage_options_json).strip():
+            raise HTTPException(
+                status_code=400,
+                detail="storage_options_json is not supported unless the server is started with --custom-config.",
+            )
+        discard_types = None
+        storage_options_json = None
+    else:
+        # In custom mode, discard/storage are controlled by the server custom config only.
+        if discard_types is not None and str(discard_types).strip():
+            raise HTTPException(
+                status_code=400,
+                detail="discard_types is controlled by server --custom-config; do not pass it per request.",
+            )
+        if storage_options_json is not None and str(storage_options_json).strip():
+            raise HTTPException(
+                status_code=400,
+                detail="storage_options_json is controlled by server --custom-config; do not pass it per request.",
+            )
+        discard_types = None
+        storage_options_json = None
+
+    try:
+        resolve_discard_policy(discard_types)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Custom mode: storage options are resolved server-side from custom config.
+    if service_cfg is not None:
+        storage_options_json = json.dumps(service_cfg.storage or {})
+
+    if storage_options_json:
+        try:
+            parsed_storage_options = json.loads(storage_options_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid storage_options_json: {exc}",
+            ) from exc
+        if not isinstance(parsed_storage_options, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="storage_options_json must be a JSON object.",
+            )
+
     effective_return_original_file = return_original_file and response_format_zip
+    if return_enhance_json and not return_md:
+        raise HTTPException(
+            status_code=400,
+            detail="return_enhance_json requires return_md=true.",
+        )
     return ParseRequestOptions(
         files=files,
         lang_list=lang_list,
@@ -731,8 +858,11 @@ async def parse_request_form(
         parse_method=validate_parse_method(parse_method),
         formula_enable=formula_enable,
         table_enable=table_enable,
+        discard_types=discard_types,
+        storage_options_json=storage_options_json,
         server_url=server_url,
         return_md=return_md,
+        return_enhance_json=return_enhance_json,
         return_middle_json=return_middle_json,
         return_model_output=return_model_output,
         return_content_list=return_content_list,
@@ -838,6 +968,12 @@ async def run_parse_job(
         parse_method=request_options.parse_method,
         formula_enable=request_options.formula_enable,
         table_enable=request_options.table_enable,
+        discard_types=request_options.discard_types,
+        storage_options=(
+            json.loads(request_options.storage_options_json)
+            if request_options.storage_options_json
+            else None
+        ),
         server_url=request_options.server_url,
         f_draw_layout_bbox=False,
         f_draw_span_bbox=False,
@@ -850,8 +986,12 @@ async def run_parse_job(
         f_dump_content_list=request_options.return_content_list,
         start_page_id=request_options.start_page_id,
         end_page_id=request_options.end_page_id,
-        **config,
+        custom_config=getattr(app.state, "custom_config", None),
     )
+    # Avoid overriding explicit request-level parameters with runtime defaults.
+    for key, value in (config or {}).items():
+        if key not in parse_kwargs:
+            parse_kwargs[key] = value
 
     if request_options.backend == "pipeline":
         async with serialize_parse_job_if_needed(request_options.backend):
@@ -910,8 +1050,11 @@ async def create_async_parse_task(
             lang_list=request_options.lang_list,
             formula_enable=request_options.formula_enable,
             table_enable=request_options.table_enable,
+            discard_types=request_options.discard_types,
+            storage_options_json=request_options.storage_options_json,
             server_url=request_options.server_url,
             return_md=request_options.return_md,
+            return_enhance_json=request_options.return_enhance_json,
             return_middle_json=request_options.return_middle_json,
             return_model_output=request_options.return_model_output,
             return_content_list=request_options.return_content_list,
@@ -1138,10 +1281,15 @@ class AsyncTaskManager:
         self.active_tasks.discard(processor)
         if processor.cancelled():
             return
-        exception = processor.exception()
+        try:
+            exception = processor.exception()
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException:
+            return
         if exception is not None:
-            logger.error(f"Async task processor crashed: {exception}")
-            self.last_worker_error = str(exception)
+            logger.error(f"Async task processor crashed: {exception!r}")
+            self.last_worker_error = str(exception) or type(exception).__name__
 
     async def _process_task(self, task_id: str) -> None:
         task = self.tasks.get(task_id)
@@ -1156,9 +1304,11 @@ class AsyncTaskManager:
                 await self._run_task(task)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
             task.status = TASK_FAILED
-            task.error = str(exc)
+            task.error = str(exc) or type(exc).__name__
             task.completed_at = utc_now_iso()
             self._signal_task_event(task_id)
             logger.exception(f"Async task failed: {task_id}")
@@ -1345,12 +1495,79 @@ async def get_async_task_result(
         backend=task.backend,
         parse_method=task.parse_method,
         return_md=task.return_md,
+        return_enhance_json=task.return_enhance_json,
         return_middle_json=task.return_middle_json,
         return_model_output=task.return_model_output,
         return_content_list=task.return_content_list,
         return_images=task.return_images,
         response_format_zip=task.response_format_zip,
         return_original_file=task.return_original_file,
+    )
+
+
+@app.get(path="/tasks/{task_id}/md", name="get_async_task_md")
+async def get_async_task_md(
+    task_id: str,
+    request: Request,
+    file_name: Optional[str] = None,
+):
+    """Download the final markdown output only.
+
+    This endpoint returns the generated `{name}.md` as a direct HTTP file stream
+    (`text/markdown; charset=utf-8`), avoiding ZIP packaging and extraction.
+
+    Query params:
+    - file_name: optional stem to select when the task contains multiple files.
+    """
+    task_manager = get_task_manager()
+    task = task_manager.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.status in (TASK_PENDING, TASK_PROCESSING):
+        return JSONResponse(
+            status_code=202,
+            content={
+                **task.to_status_payload(request),
+                "message": "Task result is not ready yet",
+            },
+        )
+
+    if task.status == TASK_FAILED:
+        return JSONResponse(
+            status_code=409,
+            content={
+                **task.to_status_payload(request),
+                "message": "Task execution failed",
+            },
+        )
+
+    selected = file_name
+    if not selected:
+        if len(task.file_names) == 1:
+            selected = task.file_names[0]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Task contains multiple files. Please specify file_name.",
+            )
+
+    parse_dir = resolve_parse_dir(
+        task.output_dir,
+        selected,
+        task.backend,
+        task.parse_method,
+        allow_office_fallback=True,
+    )
+    md_path = parse_dir / f"{selected}.md"
+    if not md_path.exists():
+        raise HTTPException(status_code=404, detail="Markdown result not found")
+
+    return FileResponse(
+        path=str(md_path),
+        media_type="text/markdown; charset=utf-8",
+        filename=f"{selected}.md",
+        status_code=200,
     )
 
 
@@ -1404,10 +1621,18 @@ async def health_check():
 @click.option("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
 @click.option("--port", default=8000, type=int, help="Server port (default: 8000)")
 @click.option("--reload", is_flag=True, help="Enable auto-reload (development mode)")
-def main(ctx, host, port, reload, **kwargs):
+@click.option(
+    "--custom-config",
+    "custom_config",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to custom (enhance/storage/discard) config file (.yaml/.yml recommended; .json supported).",
+)
+def main(ctx, host, port, reload, custom_config, **kwargs):
     kwargs.update(arg_parse(ctx))
 
     app.state.config = kwargs
+    app.state.custom_config = None if custom_config is None else load_custom_config(custom_config)
     access_log = not env_flag_enabled("MINERU_API_DISABLE_ACCESS_LOG")
 
     print(f"Start MinerU FastAPI Service: http://{host}:{port}")

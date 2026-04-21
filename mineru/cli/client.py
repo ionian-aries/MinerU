@@ -1,5 +1,6 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import asyncio
+import json
 import os
 import sys
 import threading
@@ -617,9 +618,13 @@ def build_request_form_data(
     method: str,
     formula_enable: bool,
     table_enable: bool,
+    discard_types: Optional[str],
+    storage_options_json: Optional[str],
     server_url: Optional[str],
     start_page_id: int,
     end_page_id: Optional[int],
+    *,
+    md_only: bool = False,
 ) -> dict[str, str | list[str]]:
     return _api_client.build_parse_request_form_data(
         lang_list=[lang],
@@ -627,16 +632,22 @@ def build_request_form_data(
         parse_method=method,
         formula_enable=formula_enable,
         table_enable=table_enable,
+        discard_types=discard_types,
+        storage_options_json=storage_options_json,
         server_url=server_url,
         start_page_id=start_page_id,
         end_page_id=end_page_id,
         return_md=True,
-        return_middle_json=True,
-        return_model_output=True,
-        return_content_list=True,
-        return_images=True,
+        return_enhance_json=(not md_only),
+        return_middle_json=(not md_only),
+        return_model_output=(not md_only),
+        return_content_list=(not md_only),
+        return_images=(not md_only),
+        # md_only 模式下仍用 ZIP 作为“兼容回退容器”：
+        # - 新服务端：优先走 /tasks/{id}/md 直拉文件流
+        # - 旧服务端(无 /md)：回退下载 /result 的 zip（其中只含 md）
         response_format_zip=True,
-        return_original_file=True,
+        return_original_file=(not md_only),
     )
 
 
@@ -700,6 +711,22 @@ def safe_extract_zip(zip_path: Path, output_dir: Path) -> None:
     _api_client.safe_extract_zip(zip_path, output_dir)
 
 
+def extract_md_only_from_zip(zip_path: Path, output_dir: Path) -> None:
+    """从 results.zip 中仅提取 *.md 到 output_dir（不展开其它文件）。"""
+    import zipfile
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        md_members = [m for m in zf.infolist() if m.filename.lower().endswith(".md") and not m.is_dir()]
+        if not md_members:
+            raise click.ClickException("No markdown file found in ZIP result.")
+        for member in md_members:
+            name = Path(member.filename).name
+            target = output_dir / name
+            with zf.open(member, "r") as src, open(target, "wb") as dst:
+                dst.write(src.read())
+
+
 def resolve_submit_concurrency(max_concurrent_requests: int, task_count: int) -> int:
     if max_concurrent_requests <= 0:
         raise ValueError("max_concurrent_requests must be a positive integer")
@@ -738,11 +765,16 @@ async def execute_planned_tasks(
                 await task_runner(planned_task)
             except Exception as exc:
                 assert planned_task is not None
+                logger.exception(
+                    f"Task #{planned_task.index} "
+                    f"({[doc.stem for doc in planned_task.documents]}) failed: "
+                    f"{type(exc).__name__}: {exc!r}"
+                )
                 failures.append(
                     TaskFailure(
                         task_index=planned_task.index,
                         document_stems=tuple(doc.stem for doc in planned_task.documents),
-                        message=str(exc),
+                        message=f"{type(exc).__name__}: {str(exc) or repr(exc)}",
                     )
                 )
             finally:
@@ -764,6 +796,7 @@ async def run_planned_task(
     visualization_context: Optional[VisualizationContext],
     form_data: dict[str, str],
     output_dir: Path,
+    md_only: bool = False,
     live_renderer: Optional[LiveTaskStatusRenderer] = None,
 ) -> None:
     logger.info(format_task_submission_message(planned_task, progress))
@@ -789,15 +822,42 @@ async def run_planned_task(
     finally:
         if live_renderer is not None:
             live_renderer.remove_task(submit_response.task_id)
-    zip_path = await download_result_zip(
-        client=client,
-        submit_response=submit_response,
-        planned_task=planned_task,
-    )
-    try:
-        safe_extract_zip(zip_path, output_dir)
-    finally:
-        zip_path.unlink(missing_ok=True)
+    if md_only:
+        # Only download the final markdown as a direct stream (no zip packaging/extraction).
+        if not planned_task.documents:
+            raise click.ClickException("No input documents for planned task")
+        # Support both single-doc and pipeline-packaged multi-doc tasks.
+        try:
+            for doc in planned_task.documents:
+                output_path = output_dir / f"{doc.stem}.md"
+                await _api_client.download_task_markdown(
+                    client=client,
+                    base_url=server_health.base_url,
+                    task_id=submit_response.task_id,
+                    file_name=doc.stem,
+                    output_path=output_path,
+                )
+        except _api_client.MdEndpointUnsupported:
+            # Fallback for older servers: download /result ZIP (which only contains md in md_only mode)
+            zip_path = await download_result_zip(
+                client=client,
+                submit_response=submit_response,
+                planned_task=planned_task,
+            )
+            try:
+                extract_md_only_from_zip(zip_path, output_dir)
+            finally:
+                zip_path.unlink(missing_ok=True)
+    else:
+        zip_path = await download_result_zip(
+            client=client,
+            submit_response=submit_response,
+            planned_task=planned_task,
+        )
+        try:
+            safe_extract_zip(zip_path, output_dir)
+        finally:
+            zip_path.unlink(missing_ok=True)
     completed_tasks, completed_pages = await mark_task_completed(
         progress,
         planned_task.total_pages,
@@ -810,23 +870,24 @@ async def run_planned_task(
             completed_pages,
         )
     )
-    try:
-        visualization_jobs = build_visualization_jobs(
-            planned_task,
-            output_dir,
-            backend,
-            parse_method,
-        )
-    except Exception as exc:
-        logger.warning(
-            f"Skipping visualization for {format_task_log_label(planned_task)}: {exc}"
-        )
-    else:
-        queue_visualization_jobs(
-            visualization_context,
-            visualization_jobs,
-            planned_task,
-        )
+    if not md_only:
+        try:
+            visualization_jobs = build_visualization_jobs(
+                planned_task,
+                output_dir,
+                backend,
+                parse_method,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Skipping visualization for {format_task_log_label(planned_task)}: {exc}"
+            )
+        else:
+            queue_visualization_jobs(
+                visualization_context,
+                visualization_jobs,
+                planned_task,
+            )
 
 
 async def run_orchestrated_cli(
@@ -841,6 +902,9 @@ async def run_orchestrated_cli(
     end_page_id: Optional[int],
     formula_enable: bool,
     table_enable: bool,
+    discard_types: Optional[str],
+    storage_options_json: Optional[str],
+    md_only: bool = False,
     extra_cli_args: tuple[str, ...] = (),
 ) -> None:
     if start_page_id < 0:
@@ -870,10 +934,17 @@ async def run_orchestrated_cli(
                     server_health.max_concurrent_requests
                 )
             else:
-                server_health = await fetch_server_health(
-                    http_client,
-                    normalize_base_url(api_url),
-                )
+                normalized_api_url = normalize_base_url(api_url)
+                try:
+                    server_health = await fetch_server_health(
+                        http_client,
+                        normalized_api_url,
+                    )
+                except httpx.HTTPError as exc:
+                    raise click.ClickException(
+                        f"Failed to connect to MinerU API at {normalized_api_url}. "
+                        "Please verify FastAPI is running and the --api-url port is correct."
+                    ) from exc
                 effective_max_concurrent_requests = (
                     resolve_effective_max_concurrent_requests(
                         read_max_concurrent_requests(
@@ -902,11 +973,14 @@ async def run_orchestrated_cli(
                 method=method,
                 formula_enable=formula_enable,
                 table_enable=table_enable,
+                discard_types=discard_types,
+                storage_options_json=storage_options_json,
                 server_url=server_url,
                 start_page_id=start_page_id,
                 end_page_id=end_page_id,
+                md_only=md_only,
             )
-            visualization_context = create_visualization_context()
+            visualization_context = None if md_only else create_visualization_context()
             failures = await execute_planned_tasks(
                 planned_tasks=planned_tasks,
                 concurrency=concurrency,
@@ -920,6 +994,7 @@ async def run_orchestrated_cli(
                     visualization_context=visualization_context,
                     form_data=form_data,
                     output_dir=output_dir,
+                    md_only=md_only,
                     live_renderer=live_renderer,
                 ),
             )
@@ -937,16 +1012,43 @@ async def run_orchestrated_cli(
                     local_server.stop()
             finally:
                 try:
-                    await wait_for_visualization_jobs(visualization_context)
+                    if visualization_context is not None:
+                        await wait_for_visualization_jobs(visualization_context)
                 finally:
                     if live_renderer is not None:
                         live_renderer.close()
                         _stderr_sink.set_renderer(None)
 
 
-@click.command(context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
-@click.pass_context
+class _DefaultGroup(click.Group):
+    """A click Group that falls through to a default command when no subcommand matches.
+
+    If the first arg is not a registered subcommand, the default_cmd is invoked.
+    This lets ``razel-mineru -p ... -o ...`` keep working as a shorthand for ``razel-mineru parse -p ... -o ...``.
+    """
+
+    def __init__(self, *args, default_cmd: str = "parse", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.default_cmd = default_cmd
+
+    def parse_args(self, ctx, args):
+        # If args exist and the first one is NOT a known subcommand, prepend default_cmd
+        # But preserve --help / --version at group level
+        if args and args[0] not in self.commands and args[0] not in ("--help", "-h", "--version", "-v"):
+            args = [self.default_cmd] + args
+        return super().parse_args(ctx, args)
+
+
+@click.group(cls=_DefaultGroup, default_cmd="parse",
+             context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
 @click.version_option(__version__, "--version", "-v", help="display the version and exit")
+def main():
+    """razel-mineru / mineru CLI — document parsing with semantic enhancement."""
+    pass
+
+
+@main.command("parse", context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
+@click.pass_context
 @click.option(
     "-p",
     "--path",
@@ -1081,7 +1183,42 @@ async def run_orchestrated_cli(
     default=True,
     help="Enable table parsing. Default is True. ",
 )
-def main(
+@click.option(
+    "--discard-types",
+    "discard_types",
+    type=str,
+    default=None,
+    help="Comma-separated BlockType values to discard.",
+)
+@click.option(
+    "--storage-options-json",
+    "storage_options_json",
+    type=str,
+    default=None,
+    help="Storage options JSON string (same schema as do_parse storage_options).",
+)
+@click.option(
+    "--storage-options-file",
+    "storage_options_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to a JSON file for storage options.",
+)
+@click.option(
+    "--custom-config",
+    "custom_config",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to custom (enhance/storage/discard) config file (.yaml/.yml recommended; .json supported).",
+)
+@click.option(
+    "--md-only",
+    "md_only",
+    is_flag=True,
+    default=False,
+    help="Only download the final markdown file from the API (streamed).",
+)
+def parse_cmd(
     ctx: click.Context,
     input_path: Path,
     output_dir: Path,
@@ -1094,7 +1231,60 @@ def main(
     end_page_id: Optional[int],
     formula_enable: bool,
     table_enable: bool,
+    discard_types: Optional[str],
+    storage_options_json: Optional[str],
+    storage_options_file: Optional[Path],
+    custom_config: Optional[Path],
+    md_only: bool,
 ) -> None:
+    if storage_options_json and storage_options_file:
+        raise click.ClickException(
+            "Use either --storage-options-json or --storage-options-file, not both."
+        )
+
+    # Custom mode contract:
+    # - When --custom-config is provided, all custom behavior is controlled by that file only.
+    # - When --custom-config is NOT provided, custom features are disabled (original behavior only).
+    if custom_config is None:
+        if discard_types:
+            raise click.ClickException("--discard-types requires --custom-config.")
+        if storage_options_json or storage_options_file:
+            raise click.ClickException("--storage-options-* requires --custom-config.")
+    else:
+        # For remote API, the server must be started with its own --custom-config.
+        if api_url is not None:
+            raise click.ClickException(
+                "--custom-config is only supported when using the local temporary mineru-api "
+                "(omit --api-url). For remote API, start the server with --custom-config."
+            )
+        if discard_types is not None and discard_types.strip():
+            raise click.ClickException(
+                "When --custom-config is provided, discard is controlled by the custom config file. "
+                "Do not pass --discard-types."
+            )
+        if storage_options_json is not None or storage_options_file is not None:
+            raise click.ClickException(
+                "When --custom-config is provided, storage is controlled by the custom config file. "
+                "Do not pass --storage-options-json/--storage-options-file."
+            )
+
+    if storage_options_file is not None:
+        try:
+            storage_options_json = storage_options_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise click.ClickException(
+                f"Failed to read --storage-options-file: {exc}"
+            ) from exc
+    # In custom mode, storage options come from the custom config file on the server side.
+    # Keep legacy JSON validation only when explicitly provided (and only allowed in custom mode).
+    if storage_options_json:
+        try:
+            parsed = json.loads(storage_options_json)
+        except json.JSONDecodeError as exc:
+            raise click.ClickException(f"Invalid --storage-options-json: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise click.ClickException("--storage-options-json must be a JSON object.")
+
     asyncio.run(
         run_orchestrated_cli(
             input_path=input_path,
@@ -1108,9 +1298,19 @@ def main(
             end_page_id=end_page_id,
             formula_enable=formula_enable,
             table_enable=table_enable,
-            extra_cli_args=tuple(ctx.args),
+            discard_types=discard_types,
+            storage_options_json=storage_options_json,
+            md_only=md_only,
+            extra_cli_args=(
+                tuple(ctx.args)
+                if custom_config is None
+                else tuple(ctx.args) + ("--custom-config", str(custom_config))
+            ),
         )
     )
+
+
+
 
 
 if __name__ == "__main__":

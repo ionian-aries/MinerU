@@ -1,13 +1,20 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Sequence
 
 from loguru import logger
 
-from mineru.data.data_reader_writer import FileBasedDataWriter
+from mineru.custom.registry import (
+    resolve_enhancement_enabled,
+    resolve_image_output_ref_prefix,
+    resolve_output_writers,
+)
+from mineru.custom.enhance_mvp import run_enhancement_pipeline
+from mineru.custom.custom_config_loader import CustomConfig
 from mineru.utils.draw_bbox import draw_layout_bbox, draw_span_bbox
 from mineru.utils.engine_utils import get_vlm_engine
 from mineru.utils.enum_class import MakeMode
@@ -140,9 +147,62 @@ def read_fn(path, file_suffix: str | None = None):
 def prepare_env(output_dir, pdf_file_name, parse_method):
     local_md_dir = str(os.path.join(output_dir, pdf_file_name, parse_method))
     local_image_dir = os.path.join(str(local_md_dir), "images")
-    os.makedirs(local_image_dir, exist_ok=True)
     os.makedirs(local_md_dir, exist_ok=True)
     return local_image_dir, local_md_dir
+
+
+def _resolve_storage_backend(
+    scope: str,
+    storage_options=None,
+    *,
+    custom_config: CustomConfig | None = None,
+) -> str:
+    if (
+        isinstance(storage_options, dict)
+        and isinstance(storage_options.get(scope), dict)
+        and storage_options[scope].get("backend")
+    ):
+        return str(storage_options[scope]["backend"]).strip().lower()
+    if custom_config is not None:
+        return "local"
+    scoped_env = os.getenv(f"MINERU_STORAGE_{scope.upper()}_BACKEND")
+    if scoped_env:
+        return scoped_env.strip().lower()
+    shared_env = os.getenv("MINERU_STORAGE_BACKEND")
+    if shared_env:
+        return shared_env.strip().lower()
+    return "local"
+
+
+def _join_image_ref(prefix: str, image_path: str) -> str:
+    if not prefix:
+        return image_path
+    return f"{prefix.rstrip('/')}/{str(image_path).lstrip('/')}"
+
+
+def _collect_uploaded_image_urls(pdf_info, image_prefix: str) -> list[str]:
+    urls = set()
+
+    def _walk(node):
+        if isinstance(node, dict):
+            image_path = node.get("image_path")
+            if isinstance(image_path, str) and image_path.strip():
+                urls.add(_join_image_ref(image_prefix, image_path))
+
+            html = node.get("html")
+            if isinstance(html, str) and html:
+                for src in re.findall(r'src="(?!data:)([^"]+)"', html):
+                    if src.strip():
+                        urls.add(_join_image_ref(image_prefix, src))
+
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(pdf_info)
+    return sorted(urls)
 
 
 def convert_pdf_bytes_to_bytes(pdf_bytes, start_page_id=0, end_page_id=None):
@@ -190,7 +250,21 @@ def _process_output(
         middle_json,
         model_output=None,
         process_mode="vlm",
+        storage_options=None,
+        f_dump_enhancement_json: bool = True,
+        f_dump_images_manifest: bool = True,
+        custom_config: CustomConfig | None = None,
 ):
+    """
+    该函数负责根据不同的参数与模式，处理文档解析的输出结果，并将相关文件（如可视化PDF、Markdown、JSON等）生成或保存到相应目录下。
+
+    主要功能包括：
+    1. 根据 process_mode 选择对应的 Markdown 和内容列表生成函数。
+    2. 可选绘制页面排版框/内容框，并将可视化结果保存为PDF。
+    3. 保存原始PDF或office文件副本。
+    4. 输出主Markdown文件、内容列表（JSON）、以及其他中间/模型输出（如设定）。
+    5. 支持不同文档类型和生成模式，确保输出格式与内容完整。
+    """
     from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
     if process_mode == "pipeline":
         make_func = pipeline_union_make
@@ -201,19 +275,19 @@ def _process_output(
     else:
         raise Exception(f"Unknown process_mode: {process_mode}")
     """处理输出文件"""
-    if f_draw_layout_bbox:
+    if f_draw_layout_bbox: # 在原始 PDF 上叠加段落级彩色 bbox 可视化
         try:
             draw_layout_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_layout.pdf")
         except Exception as exc:
             logger.warning(f"Skipping layout bbox visualization for {pdf_file_name}: {exc}")
 
-    if f_draw_span_bbox:
+    if f_draw_span_bbox: # 在原始 PDF 上叠加 span 级彩色 bbox 可视化
         try:
             draw_span_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_span.pdf")
         except Exception as exc:
             logger.warning(f"Skipping span bbox visualization for {pdf_file_name}: {exc}")
 
-    if f_dump_orig_pdf:
+    if f_dump_orig_pdf: # 原始 PDF 副本（或 office 原文件）
         if process_mode in ["pipeline", "vlm"]:
             md_writer.write(
                 f"{pdf_file_name}_origin.pdf",
@@ -225,39 +299,71 @@ def _process_output(
                 pdf_bytes,
             )
 
-    image_dir = str(os.path.basename(local_image_dir))
+    image_dir = resolve_image_output_ref_prefix(local_image_dir, custom_config=custom_config)
+    image_backend = _resolve_storage_backend("image", storage_options=storage_options, custom_config=custom_config)
+    if image_backend != "local" and f_dump_images_manifest:
+        image_urls = _collect_uploaded_image_urls(pdf_info, image_dir)
+        md_writer.write_string(
+            "images.json",
+            json.dumps(image_urls, ensure_ascii=False, indent=2),
+        )
 
+    enhance_enable = resolve_enhancement_enabled(custom_config=custom_config)
+    md_content_str = None
+    content_list_v2 = None
     if f_dump_md:
         md_content_str = make_func(pdf_info, f_make_md_mode, image_dir)
-        md_writer.write_string(
-            f"{pdf_file_name}.md",
-            md_content_str,
-        )
+        if enhance_enable:
+            # MVP: enhancement pipeline must consume middle_json + content_list_v2
+            content_list_v2 = make_func(pdf_info, MakeMode.CONTENT_LIST_V2, image_dir)
+            enhancement_payload, enhanced_md = run_enhancement_pipeline(
+                custom_config=custom_config,  # type: ignore[arg-type]
+                pdf_file_name=pdf_file_name,
+                process_mode=process_mode,
+                middle_json=middle_json,
+                content_list_v2=content_list_v2,
+                raw_markdown=md_content_str,
+            )
+            if f_dump_enhancement_json:
+                md_writer.write_string(
+                    f"{pdf_file_name}_enhance.json",
+                    json.dumps(enhancement_payload, ensure_ascii=False, indent=2),
+                )
+            md_writer.write_string(
+                f"{pdf_file_name}.md",  # 最终增强版 Markdown
+                enhanced_md,
+            )
+        else:
+            md_writer.write_string(
+                f"{pdf_file_name}.md", # Markdown 格式的文档内容
+                md_content_str,
+            )
 
     if f_dump_content_list:
 
         content_list = make_func(pdf_info, MakeMode.CONTENT_LIST, image_dir)
         md_writer.write_string(
-            f"{pdf_file_name}_content_list.json",
+            f"{pdf_file_name}_content_list.json", # 扁平内容列表 v1
             json.dumps(content_list, ensure_ascii=False, indent=4),
         )
 
-        content_list_v2 = make_func(pdf_info, MakeMode.CONTENT_LIST_V2, image_dir)
+        if content_list_v2 is None:
+            content_list_v2 = make_func(pdf_info, MakeMode.CONTENT_LIST_V2, image_dir)
         md_writer.write_string(
-            f"{pdf_file_name}_content_list_v2.json",
+            f"{pdf_file_name}_content_list_v2.json", # 分页内容列表 v2
             json.dumps(content_list_v2, ensure_ascii=False, indent=4),
         )
 
 
     if f_dump_middle_json:
         md_writer.write_string(
-            f"{pdf_file_name}_middle.json",
+            f"{pdf_file_name}_middle.json", # 结构化中间 JSON
             json.dumps(middle_json, ensure_ascii=False, indent=4),
         )
 
     if f_dump_model_output:
         md_writer.write_string(
-            f"{pdf_file_name}_model.json",
+            f"{pdf_file_name}_model.json", # 模型原始输出
             json.dumps(model_output, ensure_ascii=False, indent=4),
         )
 
@@ -280,6 +386,9 @@ def _process_pipeline(
         f_dump_orig_pdf,
         f_dump_content_list,
         f_make_md_mode,
+        discard_types=None,
+        storage_options=None,
+        custom_config: CustomConfig | None = None,
 ):
     """处理pipeline后端逻辑"""
     from mineru.backend.pipeline.pipeline_analyze import doc_analyze_streaming as pipeline_doc_analyze_streaming
@@ -290,7 +399,13 @@ def _process_pipeline(
     for idx, pdf_bytes in enumerate(pdf_bytes_list):
         pdf_file_name = pdf_file_names[idx]
         local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
-        image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
+        if _resolve_storage_backend("image", storage_options=storage_options, custom_config=custom_config) == "local":
+            os.makedirs(local_image_dir, exist_ok=True)
+        image_writer, md_writer = resolve_output_writers(
+            local_image_dir,
+            local_md_dir,
+            custom_config=custom_config,
+        )
         image_writer_list.append(image_writer)
         md_writer_list.append(md_writer)
         local_output_info.append((pdf_file_name, local_image_dir, local_md_dir))
@@ -307,7 +422,9 @@ def _process_pipeline(
                 middle_json["pdf_info"], pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
                 md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
                 f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-                f_make_md_mode, middle_json, model_list, process_mode="pipeline"
+                f_make_md_mode, middle_json, model_list, process_mode="pipeline",
+                storage_options=storage_options,
+                custom_config=custom_config,
             )
             logger.debug(f"Pipeline output complete: doc{doc_index}")
         except Exception:
@@ -315,6 +432,7 @@ def _process_pipeline(
             raise
 
     with ThreadPoolExecutor(max_workers=1) as output_executor:
+        # on_doc_ready 回调的实现在上层调用方（如 MinerUPipeline），负责将 middle_json 序列化写入 middle.json 文件，将 model_list 写入 _model.json 文件
         def on_doc_ready(doc_index, model_list, middle_json, ocr_enable):
             logger.debug(
                 f"Pipeline doc ready: doc{doc_index} pages={len(middle_json['pdf_info'])} output_submitted=1"
@@ -330,6 +448,7 @@ def _process_pipeline(
             parse_method=parse_method,
             formula_enable=p_formula_enable,
             table_enable=p_table_enable,
+            discard_types=discard_types,
         )
 
         for future in output_futures:
@@ -350,7 +469,10 @@ async def _async_process_vlm(
         f_dump_orig_pdf,
         f_dump_content_list,
         f_make_md_mode,
+        discard_types=None,
         server_url=None,
+        storage_options=None,
+        custom_config: CustomConfig | None = None,
         **kwargs,
 ):
     """异步处理VLM后端逻辑"""
@@ -362,10 +484,21 @@ async def _async_process_vlm(
     for idx, pdf_bytes in enumerate(pdf_bytes_list):
         pdf_file_name = pdf_file_names[idx]
         local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
-        image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
+        if _resolve_storage_backend("image", storage_options=storage_options, custom_config=custom_config) == "local":
+            os.makedirs(local_image_dir, exist_ok=True)
+        image_writer, md_writer = resolve_output_writers(
+            local_image_dir,
+            local_md_dir,
+            custom_config=custom_config,
+        )
 
         middle_json, infer_result = await aio_vlm_doc_analyze(
-            pdf_bytes, image_writer=image_writer, backend=backend, server_url=server_url, **kwargs,
+            pdf_bytes,
+            image_writer=image_writer,
+            backend=backend,
+            server_url=server_url,
+            discard_types=discard_types,
+            **kwargs,
         )
 
         pdf_info = middle_json["pdf_info"]
@@ -374,7 +507,9 @@ async def _async_process_vlm(
             pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
             md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
             f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-            f_make_md_mode, middle_json, infer_result, process_mode="vlm"
+            f_make_md_mode, middle_json, infer_result, process_mode="vlm",
+            storage_options=storage_options,
+            custom_config=custom_config,
         )
 
 
@@ -391,7 +526,10 @@ def _process_vlm(
         f_dump_orig_pdf,
         f_dump_content_list,
         f_make_md_mode,
+        discard_types=None,
         server_url=None,
+        storage_options=None,
+        custom_config: CustomConfig | None = None,
         **kwargs,
 ):
     """同步处理VLM后端逻辑"""
@@ -403,10 +541,21 @@ def _process_vlm(
     for idx, pdf_bytes in enumerate(pdf_bytes_list):
         pdf_file_name = pdf_file_names[idx]
         local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
-        image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
+        if _resolve_storage_backend("image", storage_options=storage_options, custom_config=custom_config) == "local":
+            os.makedirs(local_image_dir, exist_ok=True)
+        image_writer, md_writer = resolve_output_writers(
+            local_image_dir,
+            local_md_dir,
+            custom_config=custom_config,
+        )
 
         middle_json, infer_result = vlm_doc_analyze(
-            pdf_bytes, image_writer=image_writer, backend=backend, server_url=server_url, **kwargs,
+            pdf_bytes,
+            image_writer=image_writer,
+            backend=backend,
+            server_url=server_url,
+            discard_types=discard_types,
+            **kwargs,
         )
 
         pdf_info = middle_json["pdf_info"]
@@ -415,7 +564,9 @@ def _process_vlm(
             pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
             md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
             f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-            f_make_md_mode, middle_json, infer_result, process_mode="vlm"
+            f_make_md_mode, middle_json, infer_result, process_mode="vlm",
+            storage_options=storage_options,
+            custom_config=custom_config,
         )
 
 
@@ -435,7 +586,10 @@ def _process_hybrid(
         f_dump_orig_pdf,
         f_dump_content_list,
         f_make_md_mode,
+        discard_types=None,
         server_url=None,
+        storage_options=None,
+        custom_config: CustomConfig | None = None,
         **kwargs,
 ):
     from mineru.backend.hybrid.hybrid_analyze import doc_analyze as hybrid_doc_analyze
@@ -446,7 +600,13 @@ def _process_hybrid(
     for idx, (pdf_bytes, lang) in enumerate(zip(pdf_bytes_list, h_lang_list)):
         pdf_file_name = pdf_file_names[idx]
         local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, f"hybrid_{parse_method}")
-        image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
+        if _resolve_storage_backend("image", storage_options=storage_options, custom_config=custom_config) == "local":
+            os.makedirs(local_image_dir, exist_ok=True)
+        image_writer, md_writer = resolve_output_writers(
+            local_image_dir,
+            local_md_dir,
+            custom_config=custom_config,
+        )
 
         middle_json, infer_result, _vlm_ocr_enable = hybrid_doc_analyze(
             pdf_bytes,
@@ -455,6 +615,7 @@ def _process_hybrid(
             parse_method=parse_method,
             language=lang,
             inline_formula_enable=inline_formula_enable,
+            discard_types=discard_types,
             server_url=server_url,
             **kwargs,
         )
@@ -468,7 +629,9 @@ def _process_hybrid(
             pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
             md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
             f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-            f_make_md_mode, middle_json, infer_result, process_mode="vlm"
+            f_make_md_mode, middle_json, infer_result, process_mode="vlm",
+            storage_options=storage_options,
+            custom_config=custom_config,
         )
 
 
@@ -488,7 +651,10 @@ async def _async_process_hybrid(
         f_dump_orig_pdf,
         f_dump_content_list,
         f_make_md_mode,
+        discard_types=None,
         server_url=None,
+        storage_options=None,
+        custom_config: CustomConfig | None = None,
         **kwargs,
 ):
     from mineru.backend.hybrid.hybrid_analyze import aio_doc_analyze as aio_hybrid_doc_analyze
@@ -499,7 +665,13 @@ async def _async_process_hybrid(
     for idx, (pdf_bytes, lang) in enumerate(zip(pdf_bytes_list, h_lang_list)):
         pdf_file_name = pdf_file_names[idx]
         local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, f"hybrid_{parse_method}")
-        image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
+        if _resolve_storage_backend("image", storage_options=storage_options, custom_config=custom_config) == "local":
+            os.makedirs(local_image_dir, exist_ok=True)
+        image_writer, md_writer = resolve_output_writers(
+            local_image_dir,
+            local_md_dir,
+            custom_config=custom_config,
+        )
 
         middle_json, infer_result, _vlm_ocr_enable = await aio_hybrid_doc_analyze(
             pdf_bytes,
@@ -508,6 +680,7 @@ async def _async_process_hybrid(
             parse_method=parse_method,
             language=lang,
             inline_formula_enable=inline_formula_enable,
+            discard_types=discard_types,
             server_url=server_url,
             **kwargs,
         )
@@ -521,7 +694,9 @@ async def _async_process_hybrid(
             pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
             md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
             f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-            f_make_md_mode, middle_json, infer_result, process_mode="vlm"
+            f_make_md_mode, middle_json, infer_result, process_mode="vlm",
+            storage_options=storage_options,
+            custom_config=custom_config,
         )
 
 
@@ -535,6 +710,8 @@ def _process_office_doc(
         f_dump_orig_file=True,
         f_dump_content_list=True,
         f_make_md_mode=MakeMode.MM_MD,
+        storage_options=None,
+        custom_config: CustomConfig | None = None,
 ):
     need_remove_index = []
     for i, file_bytes in enumerate(pdf_bytes_list):
@@ -545,7 +722,13 @@ def _process_office_doc(
             need_remove_index.append(i)
 
             local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, f"office")
-            image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
+            if _resolve_storage_backend("image", storage_options=storage_options, custom_config=custom_config) == "local":
+                os.makedirs(local_image_dir, exist_ok=True)
+            image_writer, md_writer = resolve_output_writers(
+                local_image_dir,
+                local_md_dir,
+                custom_config=custom_config,
+            )
             middle_json, infer_result = office_docx_analyze(
                 file_bytes,
                 image_writer=image_writer,
@@ -559,7 +742,9 @@ def _process_office_doc(
                 pdf_info, file_bytes, pdf_file_name, local_md_dir, local_image_dir,
                 md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_file,
                 f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-                f_make_md_mode, middle_json, infer_result, process_mode="docx"
+                f_make_md_mode, middle_json, infer_result, process_mode="docx",
+                storage_options=storage_options,
+                custom_config=custom_config,
             )
         elif file_suffix in pptx_suffixes:
             need_remove_index.append(i)
@@ -591,8 +776,15 @@ def do_parse(
         f_make_md_mode=MakeMode.MM_MD,
         start_page_id=0,
         end_page_id=None,
+        discard_types=None,
+        custom_config: CustomConfig | None = None,
         **kwargs,
 ):
+    storage_options = kwargs.pop("storage_options", None)
+    if custom_config is not None:
+        discard_node = custom_config.discard or {}
+        discard_types = discard_node.get("types")
+        storage_options = custom_config.storage or {}
     need_remove_index = _process_office_doc(
         output_dir,
         pdf_file_names=pdf_file_names,
@@ -603,6 +795,8 @@ def do_parse(
         f_dump_orig_file=f_dump_orig_pdf,
         f_dump_content_list=f_dump_content_list,
         f_make_md_mode=f_make_md_mode,
+        storage_options=storage_options,
+        custom_config=custom_config,
     )
     for index in sorted(need_remove_index, reverse=True):
         del pdf_bytes_list[index]
@@ -620,7 +814,10 @@ def do_parse(
             output_dir, pdf_file_names, pdf_bytes_list, p_lang_list,
             parse_method, formula_enable, table_enable,
             f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
-            f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode
+            f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode,
+            discard_types=discard_types,
+            storage_options=storage_options,
+            custom_config=custom_config,
         )
     else:
         if backend.startswith("vlm-"):
@@ -639,7 +836,8 @@ def do_parse(
                 output_dir, pdf_file_names, pdf_bytes_list, backend,
                 f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
                 f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode,
-                server_url, **kwargs,
+                discard_types=discard_types, server_url=server_url,
+                storage_options=storage_options, custom_config=custom_config, **kwargs,
             )
         elif backend.startswith("hybrid-"):
             backend = backend[7:]
@@ -658,7 +856,8 @@ def do_parse(
                 output_dir, pdf_file_names, pdf_bytes_list, p_lang_list, parse_method, formula_enable, backend,
                 f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
                 f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode,
-                server_url, **kwargs,
+                discard_types=discard_types, server_url=server_url,
+                storage_options=storage_options, custom_config=custom_config, **kwargs,
             )
 
 
@@ -682,8 +881,15 @@ async def aio_do_parse(
         f_make_md_mode=MakeMode.MM_MD,
         start_page_id=0,
         end_page_id=None,
+        discard_types=None,
+        custom_config: CustomConfig | None = None,
         **kwargs,
 ):
+    storage_options = kwargs.pop("storage_options", None)
+    if custom_config is not None:
+        discard_node = custom_config.discard or {}
+        discard_types = discard_node.get("types")
+        storage_options = custom_config.storage or {}
     need_remove_index = _process_office_doc(
         output_dir,
         pdf_file_names=pdf_file_names,
@@ -694,6 +900,8 @@ async def aio_do_parse(
         f_dump_orig_file=f_dump_orig_pdf,
         f_dump_content_list=f_dump_content_list,
         f_make_md_mode=f_make_md_mode,
+        storage_options=storage_options,
+        custom_config=custom_config,
     )
     for index in sorted(need_remove_index, reverse=True):
         del pdf_bytes_list[index]
@@ -712,7 +920,10 @@ async def aio_do_parse(
             output_dir, pdf_file_names, pdf_bytes_list, p_lang_list,
             parse_method, formula_enable, table_enable,
             f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
-            f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode
+            f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode,
+            discard_types=discard_types,
+            storage_options=storage_options,
+            custom_config=custom_config,
         )
     else:
         if backend.startswith("vlm-"):
@@ -731,7 +942,8 @@ async def aio_do_parse(
                 output_dir, pdf_file_names, pdf_bytes_list, backend,
                 f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
                 f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode,
-                server_url, **kwargs,
+                discard_types=discard_types, server_url=server_url,
+                storage_options=storage_options, custom_config=custom_config, **kwargs,
             )
         elif backend.startswith("hybrid-"):
             backend = backend[7:]
@@ -749,7 +961,8 @@ async def aio_do_parse(
                 output_dir, pdf_file_names, pdf_bytes_list, p_lang_list, parse_method, formula_enable, backend,
                 f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
                 f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode,
-                server_url, **kwargs,
+                discard_types=discard_types, server_url=server_url,
+                storage_options=storage_options, custom_config=custom_config, **kwargs,
             )
 
 
