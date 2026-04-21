@@ -30,6 +30,7 @@ from mineru.utils.config_reader import (
 
 HEALTH_ENDPOINT = "/health"
 TASKS_ENDPOINT = "/tasks"
+TASK_MD_ENDPOINT_TEMPLATE = "/tasks/{task_id}/md"
 TASK_STATUS_POLL_INTERVAL_SECONDS = 1.0
 TASK_RESULT_TIMEOUT_SECONDS = 3600
 LOCAL_API_SHUTDOWN_TIMEOUT_SECONDS = 10
@@ -210,6 +211,12 @@ class TaskStatusSnapshot:
     queued_ahead: int | None = None
 
 
+class MdEndpointUnsupported(click.ClickException):
+    def __init__(self, status_code: int):
+        super().__init__(f"Markdown endpoint unsupported (status={status_code})")
+        self.status_code = status_code
+
+
 class LocalAPIServer:
     def __init__(self, extra_cli_args: Sequence[str] = ()):
         self.temp_dir = tempfile.TemporaryDirectory(prefix="mineru-api-client-")
@@ -348,7 +355,7 @@ class ReusableLocalAPIServer:
 
 
 def build_http_timeout() -> httpx.Timeout:
-    return httpx.Timeout(connect=10, read=60, write=300, pool=30)
+    return httpx.Timeout(connect=10, read=600, write=300, pool=30)
 
 
 def find_free_port() -> int:
@@ -509,17 +516,21 @@ def build_parse_request_form_data(
     parse_method: str,
     formula_enable: bool,
     table_enable: bool,
+    discard_types: Optional[str],
+    storage_options_json: Optional[str],
     server_url: Optional[str],
     start_page_id: int,
     end_page_id: Optional[int],
     *,
-    return_md: bool,
+    return_md_raw: bool,
+    return_md_enhanced: bool,
     return_middle_json: bool,
     return_model_output: bool,
     return_content_list: bool,
     return_images: bool,
     response_format_zip: bool,
     return_original_file: bool,
+    output_md: Optional[str] = None,
 ) -> dict[str, str | list[str]]:
     effective_lang_list = list(lang_list) or ["ch"]
     data: dict[str, str | list[str]] = {
@@ -528,7 +539,8 @@ def build_parse_request_form_data(
         "parse_method": parse_method,
         "formula_enable": str(formula_enable).lower(),
         "table_enable": str(table_enable).lower(),
-        "return_md": str(return_md).lower(),
+        "return_md_raw": str(return_md_raw).lower(),
+        "return_md_enhanced": str(return_md_enhanced).lower(),
         "return_middle_json": str(return_middle_json).lower(),
         "return_model_output": str(return_model_output).lower(),
         "return_content_list": str(return_content_list).lower(),
@@ -538,8 +550,14 @@ def build_parse_request_form_data(
         "start_page_id": str(start_page_id),
         "end_page_id": str(99999 if end_page_id is None else end_page_id),
     }
+    if output_md is not None:
+        data["output_md"] = output_md
     if server_url:
         data["server_url"] = server_url
+    if discard_types:
+        data["discard_types"] = discard_types
+    if storage_options_json:
+        data["storage_options_json"] = storage_options_json
     return data
 
 
@@ -643,6 +661,17 @@ async def wait_for_task_result(
             )
             await asyncio.sleep(TASK_STATUS_POLL_INTERVAL_SECONDS)
             continue
+        except httpx.ReadError as exc:
+            # Connection can be dropped mid-run (server restart, keep-alive race, etc.).
+            # Treat as transient and keep polling until the task deadline.
+            logger.warning(
+                "ReadError while polling task status for {} (task_id={}): {}. Retrying.",
+                task_label,
+                submit_response.task_id,
+                exc,
+            )
+            await asyncio.sleep(TASK_STATUS_POLL_INTERVAL_SECONDS)
+            continue
         if response.status_code != 200:
             raise click.ClickException(
                 f"Failed to query task status for {task_label}: "
@@ -701,6 +730,37 @@ async def download_result_zip(
     os.close(zip_fd)
     Path(zip_path).write_bytes(response.content)
     return Path(zip_path)
+
+
+async def download_task_markdown(
+    client: httpx.AsyncClient,
+    base_url: str,
+    task_id: str,
+    *,
+    file_name: str | None,
+    output_path: Path,
+) -> None:
+    """Download `{name}.md` as a direct file stream.
+
+    Server endpoint: GET /tasks/{task_id}/md
+    """
+    params: dict[str, str] = {}
+    if file_name:
+        params["file_name"] = file_name
+    url = f"{normalize_base_url(base_url)}{TASK_MD_ENDPOINT_TEMPLATE.format(task_id=task_id)}"
+
+    async with client.stream("GET", url, params=params) as response:
+        if response.status_code in (404, 405):
+            raise MdEndpointUnsupported(response.status_code)
+        if response.status_code != 200:
+            raise click.ClickException(
+                f"Failed to download markdown for task {task_id}: "
+                f"{response.status_code} {response_detail(response)}"
+            )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as handle:
+            async for chunk in response.aiter_bytes():
+                handle.write(chunk)
 
 
 def safe_extract_zip(zip_path: Path, output_dir: Path) -> None:

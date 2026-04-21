@@ -10,7 +10,8 @@ from mineru.model.docx.main import convert_binary
 
 def office_docx_analyze(
         file_bytes,
-        image_writer=None
+        image_writer=None,
+        discard_policy=None,
 ):
     infer_start = time.time()
 
@@ -24,6 +25,7 @@ def office_docx_analyze(
     middle_json = result_to_middle_json(
         results,
         image_writer,
+        discard_policy=discard_policy,
     )
 
     return middle_json, results

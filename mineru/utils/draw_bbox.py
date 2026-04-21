@@ -128,6 +128,7 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
     lists_list = []
     list_items_list = []
     indexs_list = []
+    noise_para_list = []  # 噪音块未被 discard 时留在 para_blocks 中（如自定义保留的 header/footer 等）
 
     for page in pdf_info:
         page_dropped_list = []
@@ -140,6 +141,7 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
         lists = []
         list_items = []
         indices = []
+        noise_para = []
 
         for dropped_bbox in page['discarded_blocks']:
             page_dropped_list.append(dropped_bbox['bbox'])
@@ -203,6 +205,8 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
                         list_items.append(sub_block["bbox"])
             elif block["type"] == BlockType.INDEX:
                 indices.append(bbox)
+            else:
+                noise_para.append(bbox)
 
         tables_body_list.append(tables_body)
         tables_caption_list.append(tables_caption)
@@ -219,6 +223,7 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
         codes_body_list.append(codes_body)
         codes_caption_list.append(codes_caption)
         codes_footnote_list.append(codes_footnote)
+        noise_para_list.append(noise_para)
 
     layout_bbox_list = []
 
@@ -243,6 +248,8 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
                         continue
                     bbox = sub_block["bbox"]
                     page_block_list.append(bbox)
+            else:
+                page_block_list.append(block["bbox"])
 
         layout_bbox_list.append(page_block_list)
 
@@ -275,6 +282,7 @@ def draw_layout_bbox(pdf_info, pdf_bytes, out_path, filename):
         c = draw_bbox_without_number(i, lists_list, page, c, [40, 169, 92], True)
         c = draw_bbox_without_number(i, list_items_list, page, c, [40, 169, 92], False)
         c = draw_bbox_without_number(i, indexs_list, page, c, [40, 169, 92], True)
+        c = draw_bbox_without_number(i, noise_para_list, page, c, [0, 188, 212], True) # 兜底显示噪音块
         c = draw_bbox_with_number(i, layout_bbox_list, page, c, [255, 0, 0], False, draw_bbox=False)
 
         c.save()

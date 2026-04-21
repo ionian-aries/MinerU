@@ -31,7 +31,14 @@ if llm_aided_config:
                             "please execute `pip install mineru[core]` to install the required packages.")
 
 
-def blocks_to_page_info(page_blocks, image_dict, page, image_writer, page_index) -> dict:
+def blocks_to_page_info(
+    page_blocks,
+    image_dict,
+    page,
+    image_writer,
+    page_index,
+    discard_policy=None,
+) -> dict:
     """将blocks转换为页面信息"""
 
     scale = image_dict["scale"]
@@ -41,7 +48,7 @@ def blocks_to_page_info(page_blocks, image_dict, page, image_writer, page_index)
     with pdfium_guard():
         width, height = map(int, page.get_size())
 
-    magic_model = MagicModel(page_blocks, width, height)
+    magic_model = MagicModel(page_blocks, width, height, discard_policy=discard_policy)
     image_blocks = magic_model.get_image_blocks()
     table_blocks = magic_model.get_table_blocks()
     title_blocks = magic_model.get_title_blocks()
@@ -113,13 +120,21 @@ def append_page_blocks_to_middle_json(
     pdf_doc,
     image_writer,
     page_start_index=0,
+    discard_policy=None,
     progress_bar=None,
 ):
     for offset, (page_blocks, image_dict) in enumerate(zip(model_output_blocks_list, images_list)):
         page_index = page_start_index + offset
         with pdfium_guard():
             page = pdf_doc[page_index]
-        page_info = blocks_to_page_info(page_blocks, image_dict, page, image_writer, page_index)
+        page_info = blocks_to_page_info(
+            page_blocks,
+            image_dict,
+            page,
+            image_writer,
+            page_index,
+            discard_policy=discard_policy,
+        )
         middle_json["pdf_info"].append(page_info)
         if progress_bar is not None:
             progress_bar.update(1)

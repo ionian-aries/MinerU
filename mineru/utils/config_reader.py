@@ -7,7 +7,8 @@ try:
     import torch
     import torch_npu
 except ImportError:
-    pass
+    torch = None
+    torch_npu = None
 
 
 # 定义配置文件名常量
@@ -77,13 +78,18 @@ def get_device():
     if device_mode is not None:
         return device_mode
     else:
+        # torch is an optional dependency (e.g. lightweight CLI install / no-vlm env).
+        # If torch is not available, fall back to CPU.
+        if torch is None:
+            return "cpu"
+
         if torch.cuda.is_available():
             return "cuda"
         elif torch.backends.mps.is_available():
             return "mps"
         else:
             try:
-                if torch_npu.npu.is_available():
+                if torch_npu is not None and torch_npu.npu.is_available():
                     return "npu"
             except Exception as e:
                 try:

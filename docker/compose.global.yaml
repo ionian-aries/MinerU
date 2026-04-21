@@ -1,0 +1,119 @@
+services:
+  mineru-openai-server:
+    build:
+      context: ..
+      dockerfile: docker/global/Dockerfile
+    image: razel-mineru:latest
+    container_name: razel-mineru-openai-server
+    restart: always
+    profiles: ["openai-server"]
+    ports:
+      - 30000:30000
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: mineru-openai-server
+    command:
+      --host 0.0.0.0
+      --port 30000
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+  mineru-api:
+    build:
+      context: ..
+      dockerfile: docker/global/Dockerfile
+    image: razel-mineru:latest
+    container_name: razel-mineru-api
+    restart: always
+    profiles: ["api"]
+    ports:
+      - 8000:8000
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+  mineru-router:
+    build:
+      context: ..
+      dockerfile: docker/global/Dockerfile
+    image: razel-mineru:latest
+    container_name: razel-mineru-router
+    restart: always
+    profiles: ["router"]
+    ports:
+      - 8002:8002
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: mineru-router
+    command:
+      --host 0.0.0.0
+      --port 8002
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+  mineru-gradio:
+    build:
+      context: ..
+      dockerfile: docker/global/Dockerfile
+    image: razel-mineru:latest
+    container_name: razel-mineru-gradio
+    restart: always
+    profiles: ["gradio"]
+    ports:
+      - 7860:7860
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: mineru-gradio
+    command:
+      --server-name 0.0.0.0
+      --server-port 7860
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+

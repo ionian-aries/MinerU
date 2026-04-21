@@ -68,10 +68,10 @@ def _replace_inline_base64_img_src(markup: str, image_writer, page_index: int) -
     )
 
 
-def blocks_to_page_info(page_blocks, image_writer, page_index) -> dict:
+def blocks_to_page_info(page_blocks, image_writer, page_index, discard_policy=None) -> dict:
     """将blocks转换为页面信息"""
 
-    magic_model = MagicModel(page_blocks)
+    magic_model = MagicModel(page_blocks, discard_policy=discard_policy)
     image_blocks = magic_model.get_image_blocks()
     table_blocks = magic_model.get_table_blocks()
     chart_blocks = magic_model.get_chart_blocks()
@@ -196,10 +196,10 @@ def _link_index_entries_by_anchor(middle_json: dict) -> None:
                 text_block["anchor"] = anchor
 
 
-def result_to_middle_json(model_output_blocks_list, image_writer):
+def result_to_middle_json(model_output_blocks_list, image_writer, discard_policy=None):
     middle_json = {"pdf_info": [], "_backend":"office", "_version_name": __version__}
     for index, page_blocks in enumerate(model_output_blocks_list):
-        page_info = blocks_to_page_info(page_blocks, image_writer, index)
+        page_info = blocks_to_page_info(page_blocks, image_writer, index, discard_policy=discard_policy)
         middle_json["pdf_info"].append(page_info)
 
     section_counters: dict[int, int] = defaultdict(int)

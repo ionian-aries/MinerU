@@ -49,8 +49,8 @@ def _replace_inline_base64_img_src(markup: str, image_writer, page_index: int) -
     if not markup or "base64," not in markup:
         return markup
 
-    def _replace_src(match, _writer=image_writer, _idx=page_index):
-        img_path = _save_base64_image(match.group(1), _writer, _idx)
+    def _replace_src(match, _writer=image_writer, _idx=page_index): # 正则匹配 src="data:image/...;base64,..."
+        img_path = _save_base64_image(match.group(1), _writer, _idx) # base64 解码 → {sha256}.{ext} 文件 → 替换 HTML src 为本地路径
         if img_path:
             return f'src="{img_path}"'
         return match.group(0)
@@ -64,6 +64,7 @@ def _replace_inline_base64_img_src(markup: str, image_writer, page_index: int) -
 
 def _replace_inline_table_images(preproc_blocks: list[dict], image_writer, page_index: int) -> None:
     """Persist inline base64 images embedded inside table HTML."""
+    # 遍历 TABLE → TABLE_BODY → span.html
     if not image_writer:
         return
 
@@ -85,13 +86,22 @@ def _replace_inline_table_images(preproc_blocks: list[dict], image_writer, page_
                         page_index,
                     )
 
-
-def page_model_info_to_page_info(page_model_info, image_dict, page, image_writer, page_index, ocr_enable=False):
-    scale = image_dict["scale"]
-    page_pil_img = image_dict["img_pil"]
-    page_img_md5 = bytes_md5(page_pil_img.tobytes())
+# 单页转换的核心函数
+def page_model_info_to_page_info(
+    page_model_info,
+    image_dict,
+    page,
+    image_writer,
+    page_index,
+    ocr_enable=False,
+    discard_policy=None,
+):
+    scale = image_dict["scale"] # 页面缩放比例
+    page_pil_img = image_dict["img_pil"] # 页面 PIL 图片
+    page_img_md5 = bytes_md5(page_pil_img.tobytes()) # 图片 MD5（用于图片文件命名）
     with pdfium_guard():
-        page_w, page_h = map(int, page.get_size())
+        page_w, page_h = map(int, page.get_size()) # PDF 原始页面尺寸
+    # MagicModel 构造，__init__ 内部顺序执行 7 个子步骤
     magic_model = MagicModel(
         page_model_info,
         page,
@@ -99,13 +109,14 @@ def page_model_info_to_page_info(page_model_info, image_dict, page, image_writer
         page_pil_img,
         page_w,
         page_h,
-        ocr_enable
+        ocr_enable,
+        discard_policy=discard_policy,
     )
 
     """从magic_model对象中获取后面会用到的区块信息"""
-    preproc_blocks = magic_model.get_preproc_blocks()
-    discarded_blocks = magic_model.get_discarded_blocks()
-    all_image_spans = magic_model.get_all_image_spans()
+    preproc_blocks = magic_model.get_preproc_blocks() # 主要内容块
+    discarded_blocks = magic_model.get_discarded_blocks() # 页眉/页脚/页码等
+    all_image_spans = magic_model.get_all_image_spans() # 需要截图的 span
 
     # 对image/table/chart/interline_equation的span截图
     for span in all_image_spans:
@@ -116,12 +127,13 @@ def page_model_info_to_page_info(page_model_info, image_dict, page, image_writer
             ContentType.SEAL,
             ContentType.INTERLINE_EQUATION
         ]:
+            # 从页面 PIL 图片按 bbox 裁剪，写入 images/{type}/{md5}_{page_id}_{idx}.jpg，将路径存入 span["image_path"]
             span = cut_image_and_table(span, page_pil_img, page_img_md5, page_index, image_writer, scale=scale)
 
     """构造page_info"""
-    _replace_inline_table_images(preproc_blocks, image_writer, page_index)
+    _replace_inline_table_images(preproc_blocks, image_writer, page_index) # 表格内嵌图片持久化
 
-    page_info = make_page_info_dict(preproc_blocks, page_index, page_w, page_h, discarded_blocks)
+    page_info = make_page_info_dict(preproc_blocks, page_index, page_w, page_h, discarded_blocks) # 构造 page_info
 
     return page_info
 
@@ -139,27 +151,31 @@ def append_page_model_infos_to_middle_json(
     image_writer,
     page_start_index=0,
     ocr_enable=False,
+    discard_policy=None,
     progress_bar=None,
 ):
+    # 逐页取出 PDF page 对象
     for offset, (page_model_info, image_dict) in enumerate(zip(page_model_infos, images_list)):
         page_index = page_start_index + offset
         with pdfium_guard():
-            page = pdf_doc[page_index]
+            page = pdf_doc[page_index] # 取出 pdfium page 对象
+        # 核心转换，生成的 page_info 被追加到 middle_json["pdf_info"] 列表中。
         page_info = page_model_info_to_page_info(
-            copy.deepcopy(page_model_info),
+            copy.deepcopy(page_model_info),  # ★深拷贝，避免修改 model_list 中的原始数据
             image_dict,
             page,
             image_writer,
             page_index,
             ocr_enable=ocr_enable,
+            discard_policy=discard_policy,
         )
-        if page_info is None:
+        if page_info is None: # 空页兜底处理
             with pdfium_guard():
                 page_w, page_h = map(int, pdf_doc[page_index].get_size())
-            page_info = make_page_info_dict([], page_index, page_w, page_h, [])
+            page_info = make_page_info_dict([], page_index, page_w, page_h, []) # ★追加到 middle_json
         middle_json["pdf_info"].append(page_info)
         if progress_bar is not None:
-            progress_bar.update(1)
+            progress_bar.update(1) # 更新进度条
 
 
 def append_batch_results_to_middle_json(
@@ -170,18 +186,23 @@ def append_batch_results_to_middle_json(
     image_writer,
     page_start_index=0,
     ocr_enable=False,
+    discard_policy=None,
     model_list=None,
     progress_bar=None,
-):
+):  
+    # 包装 page_model_info
     page_model_infos = []
+    # 将扁平 layout元素包装为： {layout_dets: [...], page_info: {page_no, width, height}}
     for offset, (image_dict, page_layout_dets) in enumerate(zip(images_list, batch_results)):
         page_index = page_start_index + offset
+        # 将扁平的 page_layout_dets 包装为 {layout_dets: [...], page_info: {page_no, width, height}}
         page_model_info = build_page_model_info(page_layout_dets, page_index, image_dict['img_pil'])
         page_model_infos.append(page_model_info)
 
     if model_list is not None:
-        model_list.extend(page_model_infos)
+        model_list.extend(page_model_infos) # 将 page_model_infos 追加到 model_list（最终写入 _model.json）
 
+    # 逐页处理 append_page_model_infos_to_middle_json
     append_page_model_infos_to_middle_json(
         middle_json,
         page_model_infos,
@@ -190,6 +211,7 @@ def append_batch_results_to_middle_json(
         image_writer,
         page_start_index=page_start_index,
         ocr_enable=ocr_enable,
+        discard_policy=discard_policy,
         progress_bar=progress_bar,
     )
 
@@ -327,12 +349,12 @@ def _post_block_process(pdf_info_list):
 
 def finalize_middle_json(pdf_info_list, lang=None, ocr_enable=False):
     """Apply document-level post processing once all page_info entries are ready."""
-    _apply_post_ocr(pdf_info_list, lang=lang)
-    _optimize_formula_number_blocks(pdf_info_list)
-    para_split(pdf_info_list)
-    cross_page_table_merge(pdf_info_list)
+    _apply_post_ocr(pdf_info_list, lang=lang) # ① 对含 np_img 的 span 执行补充 OCR（仅识别，不检测），填充 content 和 score
+    _optimize_formula_number_blocks(pdf_info_list) # ② 将公式编号块（FORMULA_NUMBER）合并到相邻公式块的 LaTeX 里，用 \tag{} 包裹
+    para_split(pdf_info_list) # ③ 对文本块进行段落拆分（基于行尾标点、缩进、行距等启发式规则），生成 para_blocks
+    cross_page_table_merge(pdf_info_list) # ④ 检测并合并跨页表格（由 MINERU_TABLE_MERGE_ENABLE 环境变量控制）
 
-    llm_aided_config = get_llm_aided_config()
+    llm_aided_config = get_llm_aided_config() # ⑤ 用 LLM 辅助重新判断标题层级（可选）
     if llm_aided_config is not None:
         title_aided_config = llm_aided_config.get('title_aided', None)
         if title_aided_config is not None and title_aided_config.get('enable', False):
@@ -340,10 +362,10 @@ def finalize_middle_json(pdf_info_list, lang=None, ocr_enable=False):
             llm_aided_title(pdf_info_list, title_aided_config)
             logger.info(f'llm aided title time: {round(time.time() - llm_aided_title_start_time, 2)}')
 
-    _post_block_process(pdf_info_list)
+    _post_block_process(pdf_info_list) # ⑥ 块类型规范化：DOC_TITLE → TITLE(level=1)、PARAGRAPH_TITLE → TITLE(level=2)、VERTICAL_TEXT → TEXT
 
     if os.getenv('MINERU_DONOT_CLEAN_MEM') is None and len(pdf_info_list) >= 10:
-        clean_memory(get_device())
+        clean_memory(get_device()) # ⑦ 清理显存
 
 
 def init_middle_json():
@@ -370,9 +392,9 @@ def result_to_middle_json(model_list, images_list, pdf_doc, image_writer, lang=N
 
 def make_page_info_dict(blocks, page_id, page_w, page_h, discarded_blocks):
     return_dict = {
-        'preproc_blocks': blocks,
-        'page_idx': page_id,
-        'page_size': [page_w, page_h],
-        'discarded_blocks': discarded_blocks,
+        'preproc_blocks': blocks, # 主内容块列表
+        'page_idx': page_id, # 页码
+        'page_size': [page_w, page_h], # 页面尺寸
+        'discarded_blocks': discarded_blocks, # 被丢弃的块
     }
     return return_dict

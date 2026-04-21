@@ -4,6 +4,7 @@ from typing import Literal
 
 from loguru import logger
 
+from mineru.custom.discard_policy.discard_policy import DiscardPolicy
 from mineru.utils.boxbase import calculate_overlap_area_in_bbox1_area_ratio
 from mineru.utils.enum_class import ContentType, BlockType, NotExtractType
 from mineru.utils.guess_suffix_or_lang import guess_language_by_text
@@ -23,6 +24,7 @@ class MagicModel:
         height,
         _ocr_enable,
         _vlm_ocr_enable,
+        discard_policy=None,
     ):
         (
             self.page_blocks,
@@ -32,6 +34,7 @@ class MagicModel:
 
         self.width = width
         self.height = height
+        self._discard_policy = discard_policy if isinstance(discard_policy, DiscardPolicy) else DiscardPolicy()
 
         blocks = []
         self.all_spans = []
@@ -67,13 +70,7 @@ class MagicModel:
                 block_type = block_info["type"]
                 block_content = block_info["content"]
                 block_angle = block_info["angle"]
-
-                # print(f"坐标: {block_bbox}")
-                # print(f"类型: {block_type}")
-                # print(f"内容: {block_content}")
-                # print("-" * 50)
             except Exception as e:
-                # 如果解析失败，可能是因为格式不正确，跳过这个块
                 logger.warning(f"Invalid block format: {block_info}, error: {e}")
                 continue
 
@@ -272,7 +269,7 @@ class MagicModel:
                 self.ref_text_blocks.append(block)
             elif block["type"] in [BlockType.PHONETIC]:
                 self.phonetic_blocks.append(block)
-            elif block["type"] in [BlockType.HEADER, BlockType.FOOTER, BlockType.PAGE_NUMBER, BlockType.ASIDE_TEXT, BlockType.PAGE_FOOTNOTE]:
+            elif self._discard_policy.should_discard(block):
                 self.discarded_blocks.append(block)
             elif block["type"] == BlockType.LIST:
                 self.list_blocks.append(block)

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import mimetypes
 import multiprocessing
 import os
@@ -43,6 +44,7 @@ from mineru.cli.common import (
     read_fn,
     uniquify_task_stems,
 )
+from mineru.custom.registry import resolve_discard_policy
 from mineru.cli.output_paths import resolve_parse_dir
 from mineru.cli.api_protocol import (
     API_PROTOCOL_VERSION,
@@ -63,6 +65,7 @@ from mineru.utils.config_reader import (
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_path
 from mineru.utils.pdf_image_tools import shutdown_pdf_render_executor
 from mineru.version import __version__
+from mineru.custom.custom_config_loader import load_custom_config
 
 os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
 log_level = os.getenv("MINERU_LOG_LEVEL", "INFO").upper()
@@ -136,8 +139,11 @@ class ParseRequestOptions:
     parse_method: str
     formula_enable: bool
     table_enable: bool
+    discard_types: Optional[str]
+    storage_options_json: Optional[str]
     server_url: Optional[str]
-    return_md: bool
+    return_md_raw: bool
+    return_md_enhanced: bool
     return_middle_json: bool
     return_model_output: bool
     return_content_list: bool
@@ -146,6 +152,9 @@ class ParseRequestOptions:
     return_original_file: bool
     start_page_id: int
     end_page_id: int
+    output_md: Optional[str] = None  # None = use return_md_raw/enhanced (backward compat)
+    return_layout_bbox_pdf: bool = False
+    return_span_bbox_pdf: bool = False
 
 
 @dataclass
@@ -167,8 +176,11 @@ class AsyncParseTask:
     lang_list: list[str]
     formula_enable: bool
     table_enable: bool
+    discard_types: Optional[str]
+    storage_options_json: Optional[str]
     server_url: Optional[str]
-    return_md: bool
+    return_md_raw: bool
+    return_md_enhanced: bool
     return_middle_json: bool
     return_model_output: bool
     return_content_list: bool
@@ -183,6 +195,9 @@ class AsyncParseTask:
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     error: Optional[str] = None
+    output_md: Optional[str] = None  # None = use return_md_raw/enhanced (backward compat)
+    return_layout_bbox_pdf: bool = False
+    return_span_bbox_pdf: bool = False
 
     def to_status_payload(
         self,
@@ -449,7 +464,8 @@ def build_result_dict(
     pdf_file_names: list[str],
     backend: str,
     parse_method: str,
-    return_md: bool,
+    return_md_raw: bool,
+    return_md_enhanced: bool,
     return_middle_json: bool,
     return_model_output: bool,
     return_content_list: bool,
@@ -469,8 +485,13 @@ def build_result_dict(
         if not os.path.exists(parse_dir):
             continue
 
-        if return_md:
+        if return_md_raw:
             data["md_content"] = get_infer_result(".md", pdf_name, parse_dir)
+        if return_md_enhanced:
+            data["md_content_enhanced"] = get_infer_result("_enhanced.md", pdf_name, parse_dir)
+            enhancement_path = os.path.join(parse_dir, f"{pdf_name}_enhance.json")
+            if os.path.exists(enhancement_path):
+                data["enhance_json"] = get_infer_result("_enhance.json", pdf_name, parse_dir)
         if return_middle_json:
             data["middle_json"] = get_infer_result("_middle.json", pdf_name, parse_dir)
         if return_model_output:
@@ -488,6 +509,13 @@ def build_result_dict(
                 ): f"data:{get_image_mime_type(image_path)};base64,{encode_image(image_path)}"
                 for image_path in image_paths
             }
+            images_manifest_path = os.path.join(parse_dir, "images.json")
+            if os.path.exists(images_manifest_path):
+                data["images_manifest"] = get_infer_result(
+                    "images.json",
+                    "",
+                    parse_dir,
+                )
     return result_dict
 
 
@@ -504,12 +532,16 @@ def create_result_zip(
     pdf_file_names: list[str],
     backend: str,
     parse_method: str,
-    return_md: bool,
+    return_md_raw: bool,
+    return_md_enhanced: bool,
     return_middle_json: bool,
     return_model_output: bool,
     return_content_list: bool,
     return_images: bool,
     return_original_file: bool,
+    output_md: Optional[str] = None,
+    return_layout_bbox_pdf: bool = False,
+    return_span_bbox_pdf: bool = False,
 ) -> str:
     zip_fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="mineru_results_")
     os.close(zip_fd)
@@ -525,17 +557,37 @@ def create_result_zip(
             if not os.path.exists(parse_dir):
                 continue
 
-            if return_md:
-                path = os.path.join(parse_dir, f"{pdf_name}.md")
-                if os.path.exists(path):
-                    zf.write(
-                        path,
-                        arcname=build_zip_arcname(
-                            pdf_name,
-                            parse_dir,
-                            f"{pdf_name}.md",
-                        ),
-                    )
+            raw_path = os.path.join(parse_dir, f"{pdf_name}.md")
+            enhanced_path = os.path.join(parse_dir, f"{pdf_name}_enhanced.md")
+
+            if output_md is not None:
+                # md-only mode: output_md governs which md files go in ZIP.
+                # _enhance.json is never included (it's an internal pipeline artifact).
+                if output_md in ("auto", "enhanced"):
+                    # Prefer enhanced; fall back to raw when LLM was disabled or failed.
+                    if os.path.exists(enhanced_path):
+                        zf.write(enhanced_path, arcname=build_zip_arcname(pdf_name, parse_dir, f"{pdf_name}_enhanced.md"))
+                    elif os.path.exists(raw_path):
+                        zf.write(raw_path, arcname=build_zip_arcname(pdf_name, parse_dir, f"{pdf_name}.md"))
+                elif output_md == "raw":
+                    if os.path.exists(raw_path):
+                        zf.write(raw_path, arcname=build_zip_arcname(pdf_name, parse_dir, f"{pdf_name}.md"))
+                elif output_md == "both":
+                    if os.path.exists(raw_path):
+                        zf.write(raw_path, arcname=build_zip_arcname(pdf_name, parse_dir, f"{pdf_name}.md"))
+                    if os.path.exists(enhanced_path):
+                        zf.write(enhanced_path, arcname=build_zip_arcname(pdf_name, parse_dir, f"{pdf_name}_enhanced.md"))
+            else:
+                # Full mode (output_md not provided): use return_md_raw/enhanced flags.
+                if return_md_raw:
+                    if os.path.exists(raw_path):
+                        zf.write(raw_path, arcname=build_zip_arcname(pdf_name, parse_dir, f"{pdf_name}.md"))
+                if return_md_enhanced:
+                    if os.path.exists(enhanced_path):
+                        zf.write(enhanced_path, arcname=build_zip_arcname(pdf_name, parse_dir, f"{pdf_name}_enhanced.md"))
+                    path = os.path.join(parse_dir, f"{pdf_name}_enhance.json")
+                    if os.path.exists(path):
+                        zf.write(path, arcname=build_zip_arcname(pdf_name, parse_dir, f"{pdf_name}_enhance.json"))
 
             if return_middle_json:
                 path = os.path.join(parse_dir, f"{pdf_name}_middle.json")
@@ -596,6 +648,16 @@ def create_result_zip(
                             os.path.join("images", os.path.basename(image_path)),
                         ),
                     )
+                images_manifest_path = os.path.join(parse_dir, "images.json")
+                if os.path.exists(images_manifest_path):
+                    zf.write(
+                        images_manifest_path,
+                        arcname=build_zip_arcname(
+                            pdf_name,
+                            parse_dir,
+                            "images.json",
+                        ),
+                    )
 
             if return_original_file:
                 origin_pattern = f"{pdf_name}_origin."
@@ -612,6 +674,31 @@ def create_result_zip(
                             path.name,
                         ),
                     )
+
+            if return_layout_bbox_pdf:
+                path = os.path.join(parse_dir, f"{pdf_name}_layout.pdf")
+                if os.path.exists(path):
+                    zf.write(
+                        path,
+                        arcname=build_zip_arcname(
+                            pdf_name,
+                            parse_dir,
+                            f"{pdf_name}_layout.pdf",
+                        ),
+                    )
+
+            if return_span_bbox_pdf:
+                path = os.path.join(parse_dir, f"{pdf_name}_span.pdf")
+                if os.path.exists(path):
+                    zf.write(
+                        path,
+                        arcname=build_zip_arcname(
+                            pdf_name,
+                            parse_dir,
+                            f"{pdf_name}_span.pdf",
+                        ),
+                    )
+
     return zip_path
 
 
@@ -622,7 +709,8 @@ def build_result_response(
     pdf_file_names: list[str],
     backend: str,
     parse_method: str,
-    return_md: bool,
+    return_md_raw: bool,
+    return_md_enhanced: bool,
     return_middle_json: bool,
     return_model_output: bool,
     return_content_list: bool,
@@ -630,6 +718,9 @@ def build_result_response(
     response_format_zip: bool,
     return_original_file: bool,
     zip_filename: str = "results.zip",
+    output_md: Optional[str] = None,
+    return_layout_bbox_pdf: bool = False,
+    return_span_bbox_pdf: bool = False,
 ) -> Response:
     if response_format_zip:
         zip_path = create_result_zip(
@@ -637,12 +728,16 @@ def build_result_response(
             pdf_file_names=pdf_file_names,
             backend=backend,
             parse_method=parse_method,
-            return_md=return_md,
+            return_md_raw=return_md_raw,
+            return_md_enhanced=return_md_enhanced,
             return_middle_json=return_middle_json,
             return_model_output=return_model_output,
             return_content_list=return_content_list,
             return_images=return_images,
             return_original_file=return_original_file,
+            output_md=output_md,
+            return_layout_bbox_pdf=return_layout_bbox_pdf,
+            return_span_bbox_pdf=return_span_bbox_pdf,
         )
         background_tasks.add_task(cleanup_file, zip_path)
         return FileResponse(
@@ -657,7 +752,8 @@ def build_result_response(
         pdf_file_names=pdf_file_names,
         backend=backend,
         parse_method=parse_method,
-        return_md=return_md,
+        return_md_raw=return_md_raw,
+        return_md_enhanced=return_md_enhanced,
         return_middle_json=return_middle_json,
         return_model_output=return_model_output,
         return_content_list=return_content_list,
@@ -697,7 +793,8 @@ def build_sync_file_parse_response(
             pdf_file_names=task.file_names,
             backend=task.backend,
             parse_method=task.parse_method,
-            return_md=task.return_md,
+            return_md_raw=task.return_md_raw,
+            return_md_enhanced=task.return_md_enhanced,
             return_middle_json=task.return_middle_json,
             return_model_output=task.return_model_output,
             return_content_list=task.return_content_list,
@@ -705,6 +802,9 @@ def build_sync_file_parse_response(
             response_format_zip=task.response_format_zip,
             return_original_file=task.return_original_file,
             zip_filename=f"{task.task_id}.zip",
+            output_md=task.output_md,
+            return_layout_bbox_pdf=task.return_layout_bbox_pdf,
+            return_span_bbox_pdf=task.return_span_bbox_pdf,
         )
         response.headers[FILE_PARSE_TASK_ID_HEADER] = task.task_id
         response.headers[FILE_PARSE_TASK_STATUS_HEADER] = task.status
@@ -717,7 +817,8 @@ def build_sync_file_parse_response(
         pdf_file_names=task.file_names,
         backend=task.backend,
         parse_method=task.parse_method,
-        return_md=task.return_md,
+        return_md_raw=task.return_md_raw,
+        return_md_enhanced=task.return_md_enhanced,
         return_middle_json=task.return_middle_json,
         return_model_output=task.return_model_output,
         return_content_list=task.return_content_list,
@@ -735,6 +836,7 @@ def build_sync_file_parse_response(
 
 
 async def parse_request_form(
+    request: Request,
     files: Annotated[
         list[UploadFile],
         File(
@@ -795,15 +897,27 @@ async def parse_request_form(
         bool,
         Form(description="Enable table parsing."),
     ] = True,
+    discard_types: Optional[str] = Form(
+        None,
+        description="Comma-separated BlockType values to discard.",
+    ),
+    storage_options_json: Optional[str] = Form(
+        None,
+        description="Storage options JSON string for image/doc writers.",
+    ),
     server_url: Annotated[
         Optional[str],
         Form(
             description="(Adapted only for <vlm/hybrid>-http-client backend)openai compatible server url, e.g., http://127.0.0.1:30000",
         ),
     ] = None,
-    return_md: Annotated[
+    return_md_raw: Annotated[
         bool,
-        Form(description="Return markdown content in response"),
+        Form(description="Return raw markdown content ({name}.md) in response"),
+    ] = True,
+    return_md_enhanced: Annotated[
+        bool,
+        Form(description="Return enhanced markdown ({name}_enhanced.md) and enhance JSON in response; requires enhancement to be enabled in server config"),
     ] = True,
     return_middle_json: Annotated[
         bool,
@@ -842,7 +956,95 @@ async def parse_request_form(
         int,
         Form(description="The ending page for PDF parsing, beginning from 0"),
     ] = 99999,
+    output_md: Annotated[
+        Optional[str],
+        Form(
+            description=(
+                "Markdown output mode controlling which md files are returned in the ZIP: "
+                "auto (enhanced if enabled, else raw), raw, enhanced (fallback to raw if LLM disabled), "
+                "both (raw + enhanced). When None (default), uses return_md_raw/return_md_enhanced flags."
+            ),
+        ),
+    ] = None,
+    return_layout_bbox_pdf: Annotated[
+        bool,
+        Form(
+            description=(
+                "Generate and return a PDF with layout-level (paragraph/block) bounding box "
+                "visualization overlaid on the original document ({name}_layout.pdf). "
+                "Only included in ZIP response (response_format_zip=true). "
+                "Not supported for office file backends."
+            ),
+        ),
+    ] = False,
+    return_span_bbox_pdf: Annotated[
+        bool,
+        Form(
+            description=(
+                "Generate and return a PDF with span-level bounding box visualization overlaid "
+                "on the original document ({name}_span.pdf). "
+                "Only included in ZIP response (response_format_zip=true). "
+                "Not supported for VLM, hybrid, or office file backends."
+            ),
+        ),
+    ] = False,
 ) -> ParseRequestOptions:
+    service_cfg = getattr(request.app.state, "custom_config", None)
+
+    # Custom mode contract (service-level fixed config):
+    # - If server is started without --custom-config, custom features are disabled.
+    # - Request-level overrides for discard/storage are not allowed.
+    if service_cfg is None:
+        if discard_types is not None and str(discard_types).strip():
+            raise HTTPException(
+                status_code=400,
+                detail="discard_types is not supported unless the server is started with --custom-config.",
+            )
+        if storage_options_json is not None and str(storage_options_json).strip():
+            raise HTTPException(
+                status_code=400,
+                detail="storage_options_json is not supported unless the server is started with --custom-config.",
+            )
+        discard_types = None
+        storage_options_json = None
+    else:
+        # In custom mode, discard/storage are controlled by the server custom config only.
+        if discard_types is not None and str(discard_types).strip():
+            raise HTTPException(
+                status_code=400,
+                detail="discard_types is controlled by server --custom-config; do not pass it per request.",
+            )
+        if storage_options_json is not None and str(storage_options_json).strip():
+            raise HTTPException(
+                status_code=400,
+                detail="storage_options_json is controlled by server --custom-config; do not pass it per request.",
+            )
+        discard_types = None
+        storage_options_json = None
+
+    try:
+        resolve_discard_policy(discard_types)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Custom mode: storage options are resolved server-side from custom config.
+    if service_cfg is not None:
+        storage_options_json = json.dumps(service_cfg.storage or {})
+
+    if storage_options_json:
+        try:
+            parsed_storage_options = json.loads(storage_options_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid storage_options_json: {exc}",
+            ) from exc
+        if not isinstance(parsed_storage_options, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="storage_options_json must be a JSON object.",
+            )
+
     effective_return_original_file = return_original_file and response_format_zip
     return ParseRequestOptions(
         files=files,
@@ -851,8 +1053,11 @@ async def parse_request_form(
         parse_method=validate_parse_method(parse_method),
         formula_enable=formula_enable,
         table_enable=table_enable,
+        discard_types=discard_types,
+        storage_options_json=storage_options_json,
         server_url=server_url,
-        return_md=return_md,
+        return_md_raw=return_md_raw,
+        return_md_enhanced=return_md_enhanced,
         return_middle_json=return_middle_json,
         return_model_output=return_model_output,
         return_content_list=return_content_list,
@@ -861,6 +1066,9 @@ async def parse_request_form(
         return_original_file=effective_return_original_file,
         start_page_id=start_page_id,
         end_page_id=end_page_id,
+        output_md=output_md or None,
+        return_layout_bbox_pdf=return_layout_bbox_pdf,
+        return_span_bbox_pdf=return_span_bbox_pdf,
     )
 
 
@@ -949,6 +1157,21 @@ async def run_parse_job(
     actual_lang_list = normalize_lang_list(request_options.lang_list, len(pdf_file_names))
     response_file_names = list(pdf_file_names)
 
+    # Resolve output_md: use explicit value from request if provided;
+    # otherwise derive from return_md_raw/enhanced flags (backward compat for direct API callers).
+    return_md_raw = request_options.return_md_raw
+    return_md_enhanced = request_options.return_md_enhanced
+    if request_options.output_md is not None:
+        output_md_value: str | None = request_options.output_md
+    elif return_md_raw and return_md_enhanced:
+        output_md_value = "both"
+    elif return_md_enhanced:
+        output_md_value = "enhanced"
+    elif return_md_raw:
+        output_md_value = "raw"
+    else:
+        output_md_value = None
+
     parse_kwargs = dict(
         output_dir=output_dir,
         pdf_file_names=list(pdf_file_names),
@@ -958,10 +1181,16 @@ async def run_parse_job(
         parse_method=request_options.parse_method,
         formula_enable=request_options.formula_enable,
         table_enable=request_options.table_enable,
+        discard_types=request_options.discard_types,
+        storage_options=(
+            json.loads(request_options.storage_options_json)
+            if request_options.storage_options_json
+            else None
+        ),
         server_url=request_options.server_url,
-        f_draw_layout_bbox=False,
-        f_draw_span_bbox=False,
-        f_dump_md=request_options.return_md,
+        f_draw_layout_bbox=request_options.return_layout_bbox_pdf,
+        f_draw_span_bbox=request_options.return_span_bbox_pdf,
+        f_dump_md=return_md_raw or return_md_enhanced,
         f_dump_middle_json=request_options.return_middle_json,
         f_dump_model_output=request_options.return_model_output,
         f_dump_orig_pdf=(
@@ -970,8 +1199,13 @@ async def run_parse_job(
         f_dump_content_list=request_options.return_content_list,
         start_page_id=request_options.start_page_id,
         end_page_id=request_options.end_page_id,
-        **config,
+        custom_config=getattr(app.state, "custom_config", None),
+        output_md=output_md_value,
     )
+    # Avoid overriding explicit request-level parameters with runtime defaults.
+    for key, value in (config or {}).items():
+        if key not in parse_kwargs:
+            parse_kwargs[key] = value
 
     if request_options.backend == "pipeline":
         await asyncio.to_thread(do_parse, **parse_kwargs)
@@ -1010,8 +1244,11 @@ async def create_async_parse_task(
             lang_list=request_options.lang_list,
             formula_enable=request_options.formula_enable,
             table_enable=request_options.table_enable,
+            discard_types=request_options.discard_types,
+            storage_options_json=request_options.storage_options_json,
             server_url=request_options.server_url,
-            return_md=request_options.return_md,
+            return_md_raw=request_options.return_md_raw,
+            return_md_enhanced=request_options.return_md_enhanced,
             return_middle_json=request_options.return_middle_json,
             return_model_output=request_options.return_model_output,
             return_content_list=request_options.return_content_list,
@@ -1022,6 +1259,9 @@ async def create_async_parse_task(
             end_page_id=request_options.end_page_id,
             upload_names=[upload.original_name for upload in uploads],
             uploads=[upload.path for upload in uploads],
+            output_md=request_options.output_md,
+            return_layout_bbox_pdf=request_options.return_layout_bbox_pdf,
+            return_span_bbox_pdf=request_options.return_span_bbox_pdf,
         )
         await task_manager.submit(task)
         return task
@@ -1238,10 +1478,15 @@ class AsyncTaskManager:
         self.active_tasks.discard(processor)
         if processor.cancelled():
             return
-        exception = processor.exception()
+        try:
+            exception = processor.exception()
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException:
+            return
         if exception is not None:
-            logger.error(f"Async task processor crashed: {exception}")
-            self.last_worker_error = str(exception)
+            logger.error(f"Async task processor crashed: {exception!r}")
+            self.last_worker_error = str(exception) or type(exception).__name__
 
     async def _process_task(self, task_id: str) -> None:
         task = self.tasks.get(task_id)
@@ -1256,9 +1501,11 @@ class AsyncTaskManager:
                 await self._run_task(task)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
             task.status = TASK_FAILED
-            task.error = str(exc)
+            task.error = str(exc) or type(exc).__name__
             task.completed_at = utc_now_iso()
             self._signal_task_event(task_id)
             logger.exception(f"Async task failed: {task_id}")
@@ -1448,7 +1695,8 @@ async def get_async_task_result(
         pdf_file_names=task.file_names,
         backend=task.backend,
         parse_method=task.parse_method,
-        return_md=task.return_md,
+        return_md_raw=task.return_md_raw,
+        return_md_enhanced=task.return_md_enhanced,
         return_middle_json=task.return_middle_json,
         return_model_output=task.return_model_output,
         return_content_list=task.return_content_list,
@@ -1456,6 +1704,75 @@ async def get_async_task_result(
         response_format_zip=task.response_format_zip,
         return_original_file=task.return_original_file,
         zip_filename=f"{task.task_id}.zip",
+        output_md=task.output_md,
+        return_layout_bbox_pdf=task.return_layout_bbox_pdf,
+        return_span_bbox_pdf=task.return_span_bbox_pdf,
+    )
+
+
+@app.get(path="/tasks/{task_id}/md", name="get_async_task_md")
+async def get_async_task_md(
+    task_id: str,
+    request: Request,
+    file_name: Optional[str] = None,
+):
+    """Download the final markdown output only.
+
+    This endpoint returns the generated `{name}.md` as a direct HTTP file stream
+    (`text/markdown; charset=utf-8`), avoiding ZIP packaging and extraction.
+
+    Query params:
+    - file_name: optional stem to select when the task contains multiple files.
+    """
+    task_manager = get_task_manager()
+    task = task_manager.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.status in (TASK_PENDING, TASK_PROCESSING):
+        return JSONResponse(
+            status_code=202,
+            content={
+                **task.to_status_payload(request),
+                "message": "Task result is not ready yet",
+            },
+        )
+
+    if task.status == TASK_FAILED:
+        return JSONResponse(
+            status_code=409,
+            content={
+                **task.to_status_payload(request),
+                "message": "Task execution failed",
+            },
+        )
+
+    selected = file_name
+    if not selected:
+        if len(task.file_names) == 1:
+            selected = task.file_names[0]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Task contains multiple files. Please specify file_name.",
+            )
+
+    parse_dir = resolve_parse_dir(
+        task.output_dir,
+        selected,
+        task.backend,
+        task.parse_method,
+        allow_office_fallback=True,
+    )
+    md_path = parse_dir / f"{selected}.md"
+    if not md_path.exists():
+        raise HTTPException(status_code=404, detail="Markdown result not found")
+
+    return FileResponse(
+        path=str(md_path),
+        media_type="text/markdown; charset=utf-8",
+        filename=f"{selected}.md",
+        status_code=200,
     )
 
 
@@ -1510,13 +1827,20 @@ async def health_check():
 @click.option("--port", default=8000, type=int, help="Server port (default: 8000)")
 @click.option("--reload", is_flag=True, help="Enable auto-reload (development mode)")
 @click.option(
+    "--custom-config",
+    "custom_config",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to custom (enhance/storage/discard) config file (.yaml/.yml recommended; .json supported).",
+)
+@click.option(
     "--enable-vlm-preload",
     "enable_vlm_preload",
     type=bool,
     default=False,
     help="Preload the local VLM model during mineru-api startup.",
 )
-def main(ctx, host, port, reload, enable_vlm_preload, **kwargs):
+def main(ctx, host, port, reload, enable_vlm_preload, custom_config, **kwargs):
     del kwargs
     raw_config = arg_parse(ctx)
     raw_config["enable_vlm_preload"] = enable_vlm_preload
@@ -1527,6 +1851,7 @@ def main(ctx, host, port, reload, enable_vlm_preload, **kwargs):
     os.environ["MINERU_API_ENABLE_VLM_PRELOAD"] = (
         "1" if service_config["enable_vlm_preload"] else "0"
     )
+    app.state.custom_config = None if custom_config is None else load_custom_config(custom_config)
     access_log = not env_flag_enabled("MINERU_API_DISABLE_ACCESS_LOG")
 
     print(f"Start MinerU FastAPI Service: http://{host}:{port}")

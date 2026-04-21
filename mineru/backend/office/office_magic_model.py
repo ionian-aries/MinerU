@@ -3,13 +3,15 @@ from typing import Literal
 
 from loguru import logger
 
+from mineru.custom.discard_policy.discard_policy import DiscardPolicy
 from mineru.utils.enum_class import ContentType, BlockType
 from mineru.utils.magic_model_utils import tie_up_category_by_index
 
 
 class MagicModel:
-    def __init__(self, page_blocks: list):
+    def __init__(self, page_blocks: list, discard_policy=None):
         self.page_blocks = page_blocks
+        self._discard_policy = discard_policy or DiscardPolicy()
 
         blocks = []
         self.all_spans = []
@@ -136,7 +138,7 @@ class MagicModel:
                 self.ref_text_blocks.append(block)
             elif block["type"] in [BlockType.PHONETIC]:
                 self.phonetic_blocks.append(block)
-            elif block["type"] in [BlockType.HEADER, BlockType.FOOTER, BlockType.PAGE_NUMBER, BlockType.ASIDE_TEXT, BlockType.PAGE_FOOTNOTE]:
+            elif self._discard_policy.should_discard(block):
                 self.discarded_blocks.append(block)
             elif block["type"] == BlockType.LIST:
                 self.list_blocks.append(block)

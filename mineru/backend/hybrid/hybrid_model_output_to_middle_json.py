@@ -42,6 +42,7 @@ def blocks_to_page_info(
         page_index,
         _ocr_enable,
         _vlm_ocr_enable,
+        discard_policy=None,
 ) -> dict:
     """将blocks转换为页面信息"""
 
@@ -60,6 +61,7 @@ def blocks_to_page_info(
         height,
         _ocr_enable,
         _vlm_ocr_enable,
+        discard_policy=discard_policy,
     )
     image_blocks = magic_model.get_image_blocks()
     table_blocks = magic_model.get_table_blocks()
@@ -189,6 +191,7 @@ def append_page_results_to_middle_json(
     page_start_index=0,
     _ocr_enable=False,
     _vlm_ocr_enable=False,
+    discard_policy=None,
     progress_bar=None,
 ):
     for offset, (page_model_list, image_dict) in enumerate(
@@ -197,7 +200,7 @@ def append_page_results_to_middle_json(
         page_index = page_start_index + offset
         with pdfium_guard():
             page = pdf_doc[page_index]
-        page_info = blocks_to_page_info(
+        page_info = blocks_to_page_info( # 将blocks转换为页面信息
             page_model_list,
             image_dict,
             page,
@@ -205,6 +208,7 @@ def append_page_results_to_middle_json(
             page_index,
             _ocr_enable,
             _vlm_ocr_enable,
+            discard_policy=discard_policy,
         )
         middle_json["pdf_info"].append(page_info)
         if progress_bar is not None:
@@ -220,6 +224,7 @@ def append_page_model_list_to_middle_json(
     page_start_index=0,
     _ocr_enable=False,
     _vlm_ocr_enable=False,
+    discard_policy=None,
     progress_bar=None,
 ):
     append_page_results_to_middle_json(
@@ -231,20 +236,21 @@ def append_page_model_list_to_middle_json(
         page_start_index=page_start_index,
         _ocr_enable=_ocr_enable,
         _vlm_ocr_enable=_vlm_ocr_enable,
+        discard_policy=discard_policy,
         progress_bar=progress_bar,
     )
 
 
 def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm_ocr_enable):
     if not (_vlm_ocr_enable or _ocr_enable):
-        _apply_post_ocr(pdf_info_list, hybrid_pipeline_model)
+        _apply_post_ocr(pdf_info_list, hybrid_pipeline_model) # 如果未启用VLM OCR或OCR，补充OCR识别
 
     table_enable = get_table_enable(os.getenv('MINERU_VLM_TABLE_ENABLE', 'True').lower() == 'true')
     if table_enable:
-        cross_page_table_merge(pdf_info_list)
+        cross_page_table_merge(pdf_info_list) # 检测并合并跨页表格
 
     if heading_level_import_success:
-        llm_aided_title_start_time = time.time()
+        llm_aided_title_start_time = time.time() # LLM辅助优化标题层级（可选）
         llm_aided_title(pdf_info_list, title_aided_config)
         logger.info(f'llm aided title time: {round(time.time() - llm_aided_title_start_time, 2)}')
 

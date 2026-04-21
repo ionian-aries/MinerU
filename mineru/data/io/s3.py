@@ -1,7 +1,37 @@
 import boto3
+import mimetypes
 from botocore.config import Config
 
 from ..io.base import IOReader, IOWriter
+
+
+def _is_aws_s3_endpoint(endpoint_url: str) -> bool:
+    endpoint = (endpoint_url or "").lower()
+    return "amazonaws.com" in endpoint
+
+
+def _build_s3_config(endpoint_url: str, addressing_style: str) -> Config:
+    base_kwargs = {
+        "s3": {"addressing_style": addressing_style},
+        "retries": {"max_attempts": 5, "mode": "standard"},
+    }
+    # Some S3-compatible providers (e.g. OSS) reject aws-chunked payload signing/checksum headers.
+    # Keep native AWS behavior unchanged; enable compatibility mode for non-AWS endpoints.
+    if _is_aws_s3_endpoint(endpoint_url):
+        return Config(**base_kwargs)
+
+    compat_kwargs = dict(base_kwargs)
+    compat_kwargs["s3"] = {
+        "addressing_style": addressing_style,
+        "payload_signing_enabled": False,
+    }
+    compat_kwargs["request_checksum_calculation"] = "when_required"
+    compat_kwargs["response_checksum_validation"] = "when_required"
+    try:
+        return Config(**compat_kwargs)
+    except TypeError:
+        # Older botocore may not support checksum kwargs.
+        return Config(**base_kwargs)
 
 
 class S3Reader(IOReader):
@@ -31,10 +61,7 @@ class S3Reader(IOReader):
             aws_access_key_id=ak,
             aws_secret_access_key=sk,
             endpoint_url=endpoint_url,
-            config=Config(
-                s3={'addressing_style': addressing_style},
-                retries={'max_attempts': 5, 'mode': 'standard'},
-            ),
+            config=_build_s3_config(endpoint_url, addressing_style),
         )
 
     def read(self, key: str) -> bytes:
@@ -98,10 +125,7 @@ class S3Writer(IOWriter):
             aws_access_key_id=ak,
             aws_secret_access_key=sk,
             endpoint_url=endpoint_url,
-            config=Config(
-                s3={'addressing_style': addressing_style},
-                retries={'max_attempts': 5, 'mode': 'standard'},
-            ),
+            config=_build_s3_config(endpoint_url, addressing_style),
         )
 
     def write(self, key: str, data: bytes):
@@ -111,4 +135,19 @@ class S3Writer(IOWriter):
             path (str): the path of file, if the path is relative path, it will be joined with parent_dir.
             data (bytes): the data want to write
         """
-        self._s3_client.put_object(Bucket=self._bucket, Key=key, Body=data)
+        guessed_content_type, _ = mimetypes.guess_type(key)
+        put_kwargs = {
+            "Bucket": self._bucket,
+            "Key": key,
+            "Body": data,
+            "ContentLength": len(data),
+        }
+        if guessed_content_type:
+            put_kwargs["ContentType"] = guessed_content_type
+            if guessed_content_type.startswith("image/"):
+                # Ensure browsers prefer inline preview for image links.
+                put_kwargs["ContentDisposition"] = "inline"
+
+        self._s3_client.put_object(
+            **put_kwargs,
+        )

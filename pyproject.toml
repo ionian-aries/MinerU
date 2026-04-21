@@ -22,6 +22,7 @@ dependencies = [
     "click>=8.1.7",
     "loguru>=0.7.2",
     "numpy>=1.21.6",
+    "litellm>=1.50.0,<2",
     "pdfminer.six>=20251230",
     "tqdm>=4.67.1",
     "requests",
@@ -52,6 +53,7 @@ dependencies = [
     "fastapi",
     "python-multipart",
     "uvicorn",
+    "PyYAML>=6.0.1,<7",
 ]
 
 [project.optional-dependencies]
@@ -113,6 +115,7 @@ issues = "https://github.com/opendatalab/MinerU/issues"
 
 [project.scripts]
 mineru = "mineru.cli.client:main"
+razel-mineru = "mineru.cli.client:main"
 mineru-vllm-server = "mineru.cli.vlm_server:vllm_server"
 mineru-lmdeploy-server = "mineru.cli.vlm_server:lmdeploy_server"
 mineru-openai-server = "mineru.cli.vlm_server:openai_server"
@@ -120,6 +123,15 @@ mineru-models-download = "mineru.cli.models_download:download_models"
 mineru-api = "mineru.cli.fast_api:main"
 mineru-router = "mineru.cli.router:main"
 mineru-gradio = "mineru.cli.gradio_app:main"
+
+# razel-* aliases (keep package name as mineru, only change command names)
+razel-mineru-vllm-server = "mineru.cli.vlm_server:vllm_server"
+razel-mineru-lmdeploy-server = "mineru.cli.vlm_server:lmdeploy_server"
+razel-mineru-openai-server = "mineru.cli.vlm_server:openai_server"
+razel-mineru-models-download = "mineru.cli.models_download:download_models"
+razel-mineru-api = "mineru.cli.fast_api:main"
+razel-mineru-router = "mineru.cli.router:main"
+razel-mineru-gradio = "mineru.cli.gradio_app:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "mineru.version.__version__" }
@@ -129,7 +141,10 @@ include = ["mineru*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-"mineru" = ["resources/**"]
+"mineru" = [
+    "resources/**",
+    "custom/enhance_mvp/prompts/**",
+]
 "mineru.model.utils.pytorchocr.utils" = ["resources/**"]
 
 [tool.setuptools]
